@@ -29,6 +29,10 @@ isoldewidget.py
 resources_rc.py
 pyproject.toml
 
+# espaloma-charge GNN model, if the stock charge() ever downloads it to CWD
+# (the espaloma_charge provider caches it under torch.hub instead)
+.model.pt
+
 # Distribution / packaging
 bin/
 docs/source/_build/
