@@ -15,7 +15,7 @@ def get_stepper(structure, session_restore=False):
     '''
     Get the :class:`ResidueStepper` controlling ISOLDE's navigation around the
     given structure, creating it if it doesn't yet exist.
-    '''    
+    '''
     return get_stepper_mgr(structure.session).get_stepper(structure)
 
 from chimerax.core.state import StateManager, State
@@ -26,21 +26,21 @@ class ResidueStepperMgr(StateManager):
         session._isolde_steppers = self
         if not len(session.state_managers(ResidueStepperMgr)):
             self.init_state_manager(session, base_tag='Isolde Residue Stepper Manager')
-    
+
     def register_stepper(self, stepper):
         m = stepper.structure
         if stepper.structure in self._steppers.keys():
             raise KeyError(f'Model #{m.id_string} already has a stepper registered!')
         self._steppers[m] = stepper
-    
+
     def remove_stepper(self, stepper):
         self._steppers.pop(stepper.structure, None)
-    
+
     def get_stepper(self, structure):
         if structure in self._steppers.keys():
             return self._steppers[structure]
         return ResidueStepper(structure)
-    
+
     def take_snapshot(self, session, flags):
         from . import ISOLDE_STATE_VERSION
         data = {
@@ -48,7 +48,7 @@ class ResidueStepperMgr(StateManager):
             'steppers': self._steppers
         }
         return data
-    
+
     def reset_state(self, session):
         self._steppers = {}
 
@@ -61,7 +61,7 @@ class ResidueStepperMgr(StateManager):
 
 
 
-    
+
 
 
 class ResidueStepper(State):
@@ -186,9 +186,12 @@ class ResidueStepper(State):
     def last_residue(self, polymeric_only=True):
         return self._go_to_first_residue(-1, polymeric_only)
 
-    def step_to(self, residue):
+    def step_to(self, residue, easing=None, frames=None, max_interpolate_distance=None):
         self._current_residue = residue
-        self._new_camera_position(residue)
+        self._new_camera_position(
+            residue, easing=easing, frames=frames,
+            max_interpolate_distance=max_interpolate_distance
+        )
 
 
     def _first_res(self, residues, incr):
@@ -196,8 +199,28 @@ class ResidueStepper(State):
             return residues[0]
         return residues[-1]
 
-    def _new_camera_position(self, residue, block_spotlight=True):
+    def _new_camera_position(
+        self,
+        residue,
+        block_spotlight=True,
+        easing=None,
+        frames=None,
+        max_interpolate_distance=None
+    ):
+        # easing: optional callable mapping a linear fraction in [0,1] to an eased
+        # one (e.g. ease-in-out for zero start/end velocity); None keeps the
+        # original constant-rate interpolation. frames: override the number of
+        # interpolation frames for this move only (None uses self._interpolate_frames),
+        # leaving the shared stepper's default untouched. max_interpolate_distance:
+        # moves whose centre-of-rotation shift is at least this far snap instantly
+        # instead of animating; None uses self._view_distance (the residue-stepping
+        # default that avoids long disorienting flies), while float('inf') forces
+        # animation regardless of distance (e.g. a deliberate hover-to-residue fly).
         session = self.session
+        if frames is None:
+            frames = self._interpolate_frames
+        if max_interpolate_distance is None:
+            max_interpolate_distance = self._view_distance
         r = residue
         from chimerax.atomic import Residue, Atoms
         pt = residue.polymer_type
@@ -250,9 +273,24 @@ class ResidueStepper(State):
             fw = None
         new_fw = self._view_distance*2
 
-        def interpolate_camera(session, f, cp=cp, np=np, oc=old_cofr, nc=new_cofr, fw=fw, nfw=new_fw, vr=self._view_distance, center=np.inverse()*centroid, frames=self._interpolate_frames):
+        def interpolate_camera(
+            session,
+            f,
+            cp=cp,
+            np=np,
+            oc=old_cofr,
+            nc=new_cofr,
+            fw=fw,
+            nfw=new_fw,
+            vr=self._view_distance,
+            center=np.inverse() * centroid,
+            frames=frames,
+            easing=easing
+        ):
             import numpy
             frac = (f+1)/frames
+            if easing is not None:
+                frac = easing(frac)
             v = session.main_view
             c = v.camera
             p = np if f+1==frames else cp.interpolate(np, center, frac=frac)
@@ -269,13 +307,13 @@ class ResidueStepper(State):
                 c.field_width = fw+frac*(nfw-fw)
 
         from chimerax.geometry import distance
-        if distance(new_cofr, old_cofr) < self._view_distance:
+        if distance(new_cofr, old_cofr) < max_interpolate_distance:
             if block_spotlight:
                 self._block_clipper_spotlights()
                 from .delayed_reaction import call_after_n_events
-                call_after_n_events(self.session.triggers, 'frame drawn', self._interpolate_frames, self._release_clipper_spotlights, [])
+                call_after_n_events(self.session.triggers, 'frame drawn', frames, self._release_clipper_spotlights, [])
             from chimerax.core.commands import motion
-            motion.CallForNFrames(interpolate_camera, self._interpolate_frames, session)
+            motion.CallForNFrames(interpolate_camera, frames, session)
         else:
             interpolate_camera(session, 0, frames=1)
 
@@ -388,7 +426,7 @@ class ResidueStepper(State):
         stepper.set_state_from_snapshot(session, data)
         session.triggers.add_handler('end restore session', stepper._end_restore_session_cb)
         return stepper
-    
+
     def _end_restore_session_cb(self, *_):
         '''
         In ISOLDE versions 1.7 and older `ResidueStepper` was a `StateManager` subclass,
