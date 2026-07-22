@@ -18,5 +18,7 @@ class ValidationTab(IsoldeTab):
         self.addWidget(ChiralPanel(session, isolde, parent, gui))
         from .clashes import ClashesPanel
         self.addWidget(ClashesPanel(session, isolde, parent, gui))
+        from .new_section import NewSectionPanel
+        self.addWidget(NewSectionPanel(session, isolde, parent, gui))
         from .unparameterised import UnparameterisedResiduesPanel
         self.addWidget(UnparameterisedResiduesPanel(session, isolde, parent, gui))
