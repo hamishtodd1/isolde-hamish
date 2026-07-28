@@ -25,6 +25,16 @@ does not touch the model. Interaction:
   * Clicking the arrow cycles the grey preview to the next box (wrapping);
     moving the mouse off the arrow commits the previewed box to the model.
 
+Context-aware grouping: residues that fail template matching only because they
+are covalently modified are NOT shown one-by-one. They are clustered into the
+units the parameterisation pipeline builds -- a covalent unit (e.g. a drug + the
+cysteine it is bonded to), a metal coordination site, or a novel free ligand --
+and each unit is a single row with one "Parameterise unit" button that runs that
+pipeline (AM1-BCC) for the whole unit. This happens ONLY on the user's click; the
+simulation build never parameterises on its own. A residue that merely needs
+rebuilding to an EXISTING template still gets the candidate-box row described
+above.
+
 FMCS is computed lazily (only while the section is expanded) to keep the
 background populate cheap on large models.
 '''
@@ -40,6 +50,7 @@ from Qt.QtWidgets import (
     QSizePolicy,
     QApplication,
     QToolButton,
+    QPushButton,
 )
 from Qt.QtCore import Qt, QTimer
 
@@ -53,7 +64,11 @@ from matplotlib import colormaps
 _VIRIDIS = colormaps['viridis']
 
 BOX_SIZE = 20  # px, each box is a fixed square
-GROUP_GAP = 14  # px, extra space inserted between groups
+# Gap between the three box groups (no-template | name-match | topology-match).
+# Within a group boxes are contiguous (row spacing 0); the gap only sits between
+# groups. It no longer causes hover flicker -- crossing it stays inside the row,
+# whose leaveEvent is what clears the preview (see BoxRow.leaveEvent).
+GROUP_GAP = 14  # px
 # Show roughly this many rows before the vertical scrollbar kicks in.
 VISIBLE_ROWS = 8
 
@@ -86,10 +101,13 @@ TRANSITION_FRAMES = 40
 # Hover dwell before a box previews / flies. Approximated in ms (>~2 frames)
 # because a Qt-panel hover doesn't reliably tick the GL 'new frame' trigger.
 HOVER_PREVIEW_DELAY_MS = 50
-# A residue whose centroid sits within this off-axis fraction (tan of the angle
-# from the camera's view axis) counts as "already centred" -- the hover-fly then
-# skips, leaving any manual reorientation untouched. ~0.12 ~= 7 degrees.
-CAMERA_CENTERED_FRACTION = 0.12
+# The hover-fly skips only when the residue's framing atom (CA / C1' / centroid)
+# is essentially AT the screen centre -- within this off-axis fraction (tan of
+# the angle from the view axis). Kept tight (~0.03 ~= 1.7 deg) so a residue that
+# is merely near-ish centre still flies; a real fly lands the atom on the axis
+# (~0 deg), and rotating about the centre-of-rotation keeps it there, so this
+# still suppresses re-rotation when you are already looking straight at it.
+CAMERA_CENTERED_FRACTION = 0.03
 # FMCS is NP-hard; cap each residue-vs-template comparison so a large/symmetric
 # residue can't stall the panel. RDKit returns its best match so far on timeout.
 FMCS_TIMEOUT_S = 2
@@ -105,17 +123,21 @@ def _ease_in_out_sine(t):
 
 
 def _residue_is_centred(residue):
-    '''True if the residue is already near the centre of the view (its centroid
-    within CAMERA_CENTERED_FRACTION of the view axis, in front of the camera).
-    Orientation-independent, so a user who reoriented while keeping the residue
-    framed is judged already-positioned and left undisturbed.'''
+    '''True if the residue's framing point is already near the centre of the
+    view: within CAMERA_CENTERED_FRACTION of the view axis, in front of the
+    camera. The framing point matches what ResidueStepper actually centres on --
+    the CA for an amino acid, C1' for a nucleotide, else the centroid -- NOT the
+    mean of all atoms (whose offset from the CA would make a CA-centred residue
+    read as off-centre and needlessly re-rotate). Orientation-independent, so a
+    reorientation that keeps the residue framed is left undisturbed.'''
     import numpy
     atoms = residue.atoms
     if not len(atoms):
         return False
-    centroid = atoms.scene_coords.mean(axis=0)
+    ref = residue.find_atom('CA') or residue.find_atom("C1'")
+    point = ref.scene_coord if ref is not None else atoms.scene_coords.mean(axis=0)
     cam = residue.structure.session.main_view.camera
-    to_res = centroid - cam.position.origin()
+    to_res = point - cam.position.origin()
     view_dir = cam.view_direction()
     depth = float(numpy.dot(to_res, view_dir))  # along the axis; >0 is in front
     if depth <= 0:
@@ -195,6 +217,7 @@ class SelectableBox(QFrame):
         self.setFixedSize(BOX_SIZE, BOX_SIZE)
         self._committed = False
         self._previewed = False
+        self._hovered = False
         self._apply_style()
         self.setToolTip(tooltip)
 
@@ -230,27 +253,31 @@ class SelectableBox(QFrame):
         super().mousePressEvent(event)
 
     def enterEvent(self, event):
-        # Hover (no button) previews after a short dwell; see _maybe_preview.
+        # Track hover synchronously (a flag is reliable on the very first entry,
+        # where underMouse() can still read False when the deferred check fires),
+        # then preview/fly after a short dwell; see _maybe_preview.
+        self._hovered = True
         if QApplication.mouseButtons() == Qt.MouseButton.NoButton:
             QTimer.singleShot(HOVER_PREVIEW_DELAY_MS, self._maybe_preview)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        try:
-            self.row.hover_leave(self.index)
-        except RuntimeError:
-            pass
+        # Only drop the dwell flag here; the transient preview is cleared at the
+        # ROW level (BoxRow.leaveEvent), so moving between boxes -- which stays
+        # inside the row -- never blanks the preview (no flicker).
+        self._hovered = False
         super().leaveEvent(event)
 
     def _maybe_preview(self):
-        # Deferred hover: only preview if still hovered with no button held.
-        # Guarded against the box being deleted before the timer fires.
-        try:
-            still_hovered = self.underMouse()
-        except RuntimeError:
+        # Deferred hover: fly/preview only if still hovered with no button held.
+        # The hovered flag (set in enterEvent) is more reliable than underMouse()
+        # on the first entry. Guarded in case the box/row was deleted meanwhile.
+        if not self._hovered or QApplication.mouseButtons() != Qt.MouseButton.NoButton:
             return
-        if still_hovered and QApplication.mouseButtons() == Qt.MouseButton.NoButton:
+        try:
             self.row.hover_preview(self.index)
+        except RuntimeError:
+            pass
 
 
 class ArrowButton(QToolButton):
@@ -288,7 +315,7 @@ class BoxRow(QWidget):
         self._dialog = dialog
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         hl = DefaultHLayout()
-        hl.setSpacing(2)
+        hl.setSpacing(0)  # contiguous boxes -> no dead pixels to flicker over
         # Cycle arrow, between the residue label and the first (grey) box.
         hl.addWidget(ArrowButton(self))
         self.boxes = []
@@ -354,11 +381,14 @@ class BoxRow(QWidget):
         self._set_preview(index)
         _fly_to_residue(self.residue)
 
-    def hover_leave(self, index):
-        # Leaving a hovered box drops the transient preview -- unless an
-        # arrow-cycle owns the current preview (which commits on arrow-leave).
-        if not self._arrow_armed and self._preview_index == index:
+    def leaveEvent(self, event):
+        # Mouse left the whole row -> drop the transient hover-preview. Boxes and
+        # the arrow are children, so moving among them does NOT fire this -> the
+        # preview transitions box-to-box without blanking. An armed arrow-cycle
+        # is committed by the arrow's own leave, so don't clear it here.
+        if not self._arrow_armed and self._preview_index is not None:
             self._set_preview(None)
+        super().leaveEvent(event)
 
     # --- box click -------------------------------------------------------
     def click(self, index):
@@ -382,6 +412,50 @@ class BoxRow(QWidget):
             self._arrow_armed = False
             self._set_preview(None)
             self._commit(index)
+
+
+class ParameteriseRow(QWidget):
+    '''Row for a unit that needs a *fresh* MD template built -- a covalent unit, a
+    metal site, or a novel free ligand with no existing template to rebuild to. A
+    single button runs the existing parameterisation pipeline (AM1-BCC) for the
+    whole unit. The button is disabled, with an explanatory note, when the unit
+    cannot be built here: too large for AM1-BCC, an unsupported metal (no bundled
+    LJ parameters, e.g. Mo), or a metal site whose donors could not be resolved.'''
+
+    def __init__(self, descriptor, dialog=None, parent=None):
+        super().__init__(parent)
+        self._descriptor = descriptor
+        self._dialog = dialog
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        hl = DefaultHLayout()
+        kind = descriptor['kind']
+        btn = QPushButton('Parameterise ligand' if kind == 'free' else 'Parameterise unit')
+        # Reasons the unit can't be built here (button disabled + note shown):
+        # an unsupported metal, an unresolved metal site, or too large for AM1-BCC.
+        note = descriptor.get('unsupported') or descriptor.get('error')
+        if note is None and descriptor['too_big']:
+            note = (
+                '{} heavy atoms -- too large for AM1-BCC; parameterise externally'.format(
+                    descriptor['num_heavy_atoms']
+                )
+            )
+        if note is not None:
+            btn.setEnabled(False)
+            btn.setToolTip(note)
+        else:
+            btn.clicked.connect(self._clicked)
+        hl.addWidget(btn)
+        if note is not None:
+            lbl = QLabel(note)
+            lbl.setStyleSheet('color: #b0b0b0; font-style: italic;')
+            hl.addSpacing(6)
+            hl.addWidget(lbl)
+        hl.addStretch()
+        self.setLayout(hl)
+
+    def _clicked(self, *_):
+        if self._dialog is not None:
+            self._dialog.parameterise_unit(self._descriptor)
 
 
 class NewSectionPanel(CollapsibleArea):
@@ -421,8 +495,16 @@ class NewSectionDialog(UI_Panel_Base):
 
         self.rows = []
         self._dirty = False
+        # Set True by cleanup() so the self-rescheduling _process_next build chain
+        # stops if the panel is torn down mid-populate (e.g. the window is closed).
+        self._deleted = False
         self._preview_row = None
         self._preview_structure = None
+        # Progressive population: rows are built one residue per event-loop turn
+        # so they appear as they arrive. _build_gen invalidates an in-flight
+        # incremental build if the panel is refreshed again mid-stream.
+        self._build_gen = 0
+        self._pending = []
         # Memoised CCD-derived lookups, keyed by ccd_name, so each component is
         # fetched at most once (the CCD network-fetch fallback is the main source
         # of both the populate delay and the "Error fetching CCD ..." log spam).
@@ -436,24 +518,82 @@ class NewSectionDialog(UI_Panel_Base):
         )
         self.container.expanded.connect(self._refresh)
 
+    def cleanup(self):
+        # Stop the self-rescheduling _process_next build chain before our Qt
+        # widgets are destroyed, then let the base class drop trigger handlers.
+        self._deleted = True
+        super().cleanup()
+
     def _refresh(self, *_):
+        if self._deleted:
+            return
         if self.container.is_collapsed:
             self._dirty = True
             return
         self._dirty = False
-        self.remove_preview()
-        self._rebuild(self._residue_template_options())
-
-    def _rebuild(self, options):
         self._clear_rows()
-        grid = self._grid
-        for i, (residue, name_cands, comp_cands) in enumerate(options):
-            text = '{}, chain {}'.format(residue.name, residue.chain_id)
-            grid.addWidget(QLabel(text), i, 0, Qt.AlignmentFlag.AlignVCenter)
-            row = BoxRow(name_cands, comp_cands, residue=residue, dialog=self)
-            grid.addWidget(row, i, 1, Qt.AlignmentFlag.AlignVCenter)
-            self.rows.append(row)
-        self._size_scroll(len(self.rows))
+        self._build_gen += 1
+        # Cheap bulk step: which residues are unparameterised + their raw
+        # candidate sources. The expensive per-candidate FMCS is deferred to
+        # _process_next so rows appear progressively rather than all at once.
+        self._pending = self._detect()
+        self._size_scroll(len(self._pending))
+        self._process_next(self._build_gen)
+
+    def _process_next(self, gen):
+        # Build one entry's row per event-loop turn (so each paints as it lands),
+        # bailing out if a newer refresh has superseded this build, or the panel
+        # was torn down (window closed) while this deferred build was queued. An
+        # entry is either a covalent/metal UNIT (a single "Parameterise unit" row)
+        # or one free residue (the existing candidate-box / rebuild row, or -- when
+        # it has no viable existing template -- a "Parameterise ligand" row).
+        if self._deleted or gen != self._build_gen or not self._pending:
+            return
+        entry = self._pending.pop(0)
+        i = len(self.rows)
+        try:
+            if entry[0] == 'unit':
+                descriptor = entry[1]
+                self._add_parameterise_row(i, descriptor, self._unit_label(descriptor))
+            else:
+                _, residue, kind, payload, descriptor = entry
+                name_cands, comp_cands = self._candidates_for(kind, payload, residue)
+                label = '{}, chain {}'.format(residue.name, residue.chain_id)
+                if descriptor is not None and not name_cands and not comp_cands:
+                    # A novel free ligand with no existing-template candidate: offer
+                    # to build a fresh template rather than show an empty box row.
+                    self._add_parameterise_row(i, descriptor, label)
+                else:
+                    self._grid.addWidget(QLabel(label), i, 0, Qt.AlignmentFlag.AlignVCenter)
+                    row = BoxRow(name_cands, comp_cands, residue=residue, dialog=self)
+                    self._grid.addWidget(row, i, 1, Qt.AlignmentFlag.AlignVCenter)
+                    self.rows.append(row)
+        except RuntimeError:
+            # A Qt widget (e.g. the grid) was destroyed while this build was queued
+            # -- the panel is gone; stop the chain rather than crash.
+            self._deleted = True
+            return
+        if self._pending:
+            QTimer.singleShot(0, lambda: self._process_next(gen))
+
+    def _add_parameterise_row(self, i, descriptor, label):
+        '''A label + a ParameteriseRow (the "build a fresh template for this whole
+        unit" action) at grid row `i`.'''
+        self._grid.addWidget(QLabel(label), i, 0, Qt.AlignmentFlag.AlignVCenter)
+        row = ParameteriseRow(descriptor, dialog=self)
+        self._grid.addWidget(row, i, 1, Qt.AlignmentFlag.AlignVCenter)
+        self.rows.append(row)
+
+    @staticmethod
+    def _unit_label(descriptor):
+        '''Label for a unit row -- its member residues, seed first, e.g.
+        "08J 1 (Z) + CYS 145 (A)".'''
+        seed = descriptor['seed']
+        members = [seed] + [r for r in descriptor['residues'] if r is not seed]
+        parts = [
+            '{} {} ({})'.format(r.name, r.number, r.chain_id) for r in members if not r.deleted
+        ]
+        return ' + '.join(parts) if parts else '(deleted residue)'
 
     def _size_scroll(self, n_rows):
         # Size the scroll area to its content, up to VISIBLE_ROWS (then scroll).
@@ -577,13 +717,63 @@ class NewSectionDialog(UI_Panel_Base):
                 )
             )
 
+    def parameterise_unit(self, descriptor):
+        '''Build a fresh MD template for a whole unit via the existing pipeline
+        (covalent unit / metal site / free ligand), then refresh. This runs ONLY
+        on the user's explicit button click -- the simulation build never
+        parameterises on its own. AM1-BCC is synchronous and can take from seconds
+        to minutes, so a busy cursor + status line flag the wait. On success the
+        pipeline sets isolde_template_name / loads a USER_ template, so the
+        residues drop out of the next detection and the next sim start matches
+        them automatically.'''
+        seed = descriptor['seed']
+        if seed is None or seed.deleted:
+            return
+        kind = descriptor['kind']
+        unit = descriptor['unit']
+        label = self._unit_label(descriptor)
+        self.session.logger.status(
+            'Parameterising {} (running AM1-BCC; this may take a while)...'.format(label)
+        )
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            from chimerax.isolde.openmm.amberff.covalent import (
+                parameterise_metal_site,
+                parameterise_covalent_unit,
+                parameterise_free_ligand,
+            )
+            if kind == 'metal':
+                parameterise_metal_site(self.session, unit)
+            elif kind == 'covalent':
+                parameterise_covalent_unit(self.session, unit)
+            else:
+                parameterise_free_ligand(self.session, seed)
+        except Exception as e:
+            self.session.logger.warning(
+                'New section: parameterisation of {} failed ({}: {})'.format(
+                    label, e.__class__.__name__, e
+                )
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.session.logger.status('')
+        self._refresh()
+
     # --- data (FMCS-scored candidate templates) --------------------------
-    def _residue_template_options(self):
-        '''For each unparameterised residue in the selected model, return
-        (residue, name_cands, comp_cands). find_possible_templates supplies the
-        candidate template *names* (its match score is ignored); each is scored,
-        coloured and ordered by RDKit FMCS overlap with the residue. [] if none /
-        no model. No side effects (in particular no add-hydrogens prompt).'''
+    def _detect(self):
+        '''Bulk step: the selected model's unparameterised residues, CLUSTERED into
+        the units the parameterisation pipeline builds, WITHOUT the per-candidate
+        FMCS. Returns a list of entries, each either:
+
+          * ``('unit', descriptor)`` -- a covalent unit or metal site (rendered as
+            one "Parameterise unit" row); or
+          * ``('residue', residue, kind, payload, descriptor)`` -- a single free
+            residue (the existing candidate-box flow), where kind is 'unmatched'
+            (payload = the OpenMM residue, for find_possible_templates) or
+            'ambiguous' (payload = the competing template_info), and descriptor is
+            its 'free' grouping descriptor (None only if grouping itself failed).
+
+        [] if none / no model. Detection + grouping only -- no side effects.'''
         isolde = self.isolde
         m = isolde.selected_model
         if m is None:
@@ -606,30 +796,61 @@ class NewSectionDialog(UI_Panel_Base):
             _, ambiguous, unmatched = ff.assignTemplates(
                 top, ignoreExternalBonds=True, explicit_templates=residue_templates
             )
-            out = []
-            for r in unmatched:
-                cx_res = residues[r.index]
-                res_mol = self._residue_mol(cx_res)
-                by_name, by_comp = ff.find_possible_templates(r)
-                out.append(
-                    (
-                        cx_res,
-                        self._candidates([tn for tn, _ in by_name], 'Name Match', res_mol),
-                        self._candidates([tn for tn, _ in by_comp], 'Topology Match', res_mol),
-                    )
-                )
-            for r, template_info in ambiguous.items():
-                cx_res = residues[r.index]
-                res_mol = self._residue_mol(cx_res)
-                names = [ti[0].name for ti in template_info]
-                out.append((cx_res, [], self._candidates(names, 'Topology Match', res_mol)))
         except Exception as e:
             self.session.logger.info(
                 'New section: could not determine unparameterised residues '
                 '({}: {})'.format(e.__class__.__name__, e)
             )
             return []
-        return out
+        # Map the OpenMM offenders back to ChimeraX residues, keeping each one's
+        # per-residue payload for the free-ligand FMCS candidate lookup.
+        payload_by_residue = {}
+        for r in unmatched:
+            payload_by_residue[residues[r.index]] = ('unmatched', r)
+        for r, tinfo in ambiguous.items():
+            payload_by_residue[residues[r.index]] = ('ambiguous', tinfo)
+        offenders = list(payload_by_residue.keys())
+        if not offenders:
+            return []
+        # Context-aware grouping: cluster the isolated failures into the units the
+        # pipeline actually builds (metal site / covalent unit / free ligand), so a
+        # covalent ligand + its partner residue is ONE entry rather than several.
+        # Cheap (graph/geometry only); no model mutation.
+        try:
+            from chimerax.isolde.openmm.amberff.covalent import (group_for_parameterisation)
+            groups = group_for_parameterisation(self.session, offenders, forcefield=ff)
+        except Exception as e:
+            self.session.logger.info(
+                'New section: could not group unparameterised residues; falling '
+                'back to per-residue ({}: {})'.format(e.__class__.__name__, e)
+            )
+            return [('residue', r, k, p, None) for r, (k, p) in payload_by_residue.items()]
+        entries = []
+        for g in groups:
+            if g['kind'] in ('metal', 'covalent'):
+                entries.append(('unit', g))
+            else:  # free -> keep the per-residue candidate / rebuild flow
+                r = g['seed']
+                kind, payload = payload_by_residue.get(r, ('unmatched', None))
+                entries.append(('residue', r, kind, payload, g))
+        return entries
+
+    def _candidates_for(self, kind, payload, residue):
+        '''(name_cands, comp_cands) for one residue -- the expensive per-candidate
+        FMCS step, run lazily from _process_next so rows appear progressively.'''
+        res_mol = self._residue_mol(residue)
+        if kind == 'unmatched':
+            try:
+                ff = self.isolde.forcefield_mgr[self.isolde.sim_params.forcefield]
+                by_name, by_comp = ff.find_possible_templates(payload)
+            except Exception:
+                by_name, by_comp = [], []
+            return (
+                self._candidates([tn for tn, _ in by_name], 'Name Match', res_mol),
+                self._candidates([tn for tn, _ in by_comp], 'Topology Match', res_mol),
+            )
+        names = [ti[0].name for ti in payload]
+        return ([], self._candidates(names, 'Topology Match', res_mol))
 
     def _candidates(self, template_names, kind, res_mol):
         '''Candidate descriptors for a group, ordered by descending FMCS overlap

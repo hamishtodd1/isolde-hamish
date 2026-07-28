@@ -51,31 +51,50 @@ def parameterise_cmd(session, residues, override=False, net_charge=None,
                      reference_model=None, fetch_reference=False):
     from chimerax.core.errors import UserError
     from chimerax.atomic import Residues
+    from .covalent import (group_for_parameterisation, parameterise_metal_site,
+                           parameterise_covalent_unit, parameterise_free_ligand)
 
-    # Metal-involved residues (a residue that contains, or is bonded to, a metal
-    # atom) route to the bonded metal-site pipeline first -- GAFF2 cannot type a
-    # metal, so these must not fall through to the covalent/free organic paths.
-    def _metal_involved(r):
-        if any(a.element.is_metal for a in r.atoms):
-            return True
-        return any(nb.element.is_metal for a in r.atoms for nb in a.neighbors)
-    metal_seeds = [r for r in residues if _metal_involved(r)]
-    handled_metal = set()
-    if metal_seeds:
-        from .covalent import detect_metal_site, parameterise_metal_site
-        for r in metal_seeds:
-            if r in handled_metal:
-                continue
-            try:
-                site = detect_metal_site(r)
-            except UserError as e:
+    # Classify every selected residue into the unit the pipeline actually builds
+    # -- metal site, covalent unit or free ligand -- via the shared grouping
+    # function (the SAME one the validation panel uses, so routing can never
+    # diverge). Grouping is detection-only (metal-first, so a metal never falls
+    # through to GAFF2); the builds happen per descriptor below.
+    forcefield = None
+    if hasattr(session, 'isolde'):
+        ff_name = session.isolde.sim_params.forcefield
+        forcefield = session.isolde.forcefield_mgr[ff_name]
+    groups = group_for_parameterisation(session, residues, max_heavy_atoms=250,
+                                        forcefield=forcefield)
+
+    free_seeds = []
+    for g in groups:
+        kind = g['kind']
+        if g['too_big']:
+            msg = ('The %s unit %r has %d heavy atoms, above the limit of 250. '
+                   'AM1-BCC on a fragment this large is unlikely to converge; '
+                   'parameterise it externally.'
+                   % (kind, g['unit'], g['num_heavy_atoms']))
+            if always_raise_errors:
+                raise UserError(msg)
+            session.logger.warning(msg)
+            continue
+        if kind == 'metal':
+            if g['unit'] is None:
+                # Metal-involved but no coordination site could be resolved (e.g.
+                # no donors found). Surface that, rather than misrouting to GAFF2.
                 if always_raise_errors:
-                    raise
-                session.logger.warning(str(e))
+                    raise UserError(g['error'])
+                session.logger.warning(g['error'])
                 continue
-            handled_metal.update(site.residues)
+            if g.get('unsupported'):
+                # An unsupported metal (no bundled LJ params, e.g. Mo): refuse up
+                # front, before the slow AM1-BCC inside parameterise_metal_site.
+                if always_raise_errors:
+                    raise UserError(g['unsupported'])
+                session.logger.warning(g['unsupported'])
+                continue
             try:
-                parameterise_metal_site(session, site, shell_radius=shell_radius,
+                parameterise_metal_site(session, g['unit'], shell_radius=shell_radius,
                                         net_charge=net_charge,
                                         base_templates=base_templates,
                                         reference_model=reference_model,
@@ -84,39 +103,31 @@ def parameterise_cmd(session, residues, override=False, net_charge=None,
                 if always_raise_errors:
                     raise UserError(str(e))
                 session.logger.warning('Metal-site parameterisation of %r failed: %s'
-                                       % (site, e))
-        residues = Residues([r for r in residues if r not in handled_metal])
-        if not len(residues):
-            return
-
-    # Covalent residues (bonded to another residue) route to the covalent-unit
-    # pipeline; free ligands take the classic single-residue path below.
-    covalent = [r for r in residues if len(r.neighbors) != 0]
-    if covalent:
-        from .covalent import detect_covalent_unit, parameterise_covalent_unit
-        handled = set()
-        for r in covalent:
-            if r in handled:
-                continue
+                                       % (g['unit'], e))
+        elif kind == 'covalent':
             try:
-                unit = detect_covalent_unit(r)
-            except UserError as e:
-                if always_raise_errors:
-                    raise
-                session.logger.warning(str(e))
-                continue
-            handled.update(unit.residues)
-            try:
-                parameterise_covalent_unit(session, unit, shell_radius=shell_radius,
+                parameterise_covalent_unit(session, g['unit'], shell_radius=shell_radius,
                                            net_charge=net_charge,
                                            base_templates=base_templates)
             except Exception as e:
                 if always_raise_errors:
                     raise UserError(str(e))
                 session.logger.warning('Covalent parameterisation of %r failed: %s'
-                                       % (unit, e))
+                                       % (g['unit'], e))
+        else:  # free ligand
+            if g['had_neighbours']:
+                # Has inter-residue bonds but no non-standard linkage (a plain
+                # in-chain residue): not a covalent unit and not a free ligand.
+                msg = ('Selected residue(s) have no non-standard covalent linkage '
+                       'to parameterise. For a free ligand use "isolde '
+                       'parameterise" instead.')
+                if always_raise_errors:
+                    raise UserError(msg)
+                session.logger.warning(msg)
+                continue
+            free_seeds.append(g['seed'])
 
-    free = Residues([r for r in residues if len(r.neighbors) == 0])
+    free = Residues(free_seeds)
     if not len(free):
         return
     unique_residue_types = [free[free.names == name][0] for name in free.unique_names]

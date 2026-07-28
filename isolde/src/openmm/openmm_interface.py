@@ -1455,10 +1455,15 @@ class SimHandler:
                 system = self._create_openmm_system(ff, top, sim_params,
                     residue_templates, residues=all_residues)
             except UnparameterisedResiduesError as e:
-                offenders = [r for r in (e.unmatched + e.ambiguous)
-                    if getattr(r, 'isolde_template_name', None) is not None]
-                if attempt == 0 and offenders:
-                    for r in offenders:
+                if attempt == 0:
+                    recovered = False
+                    all_offenders = list(e.unmatched) + list(e.ambiguous)
+                    # (a) A stale isolde_template_name override that no longer
+                    # matches its residue: clear it so the residue gets a fair
+                    # shot at automatic assignment on the retry.
+                    stale = [r for r in all_offenders
+                        if getattr(r, 'isolde_template_name', None) is not None]
+                    for r in stale:
                         logger.warning(
                             'Residue {} was assigned template "{}" via its '
                             'isolde_template_name override, but that template '
@@ -1466,9 +1471,54 @@ class SimHandler:
                             'and retrying with automatic template assignment.'
                             .format(r, r.isolde_template_name))
                         r.isolde_template_name = None
-                    continue
+                        recovered = True
+                    # (b) Fresh offenders (no override): auto-parameterise them so
+                    # the user need not click "Parameterise unit" first. A unit
+                    # that cannot be built stays unmatched, so the retry re-raises
+                    # -- a parameterisation failure is a show-stopper for sim start.
+                    fresh = [r for r in all_offenders
+                        if getattr(r, 'isolde_template_name', None) is None]
+                    if fresh and self._auto_parameterise_offenders(fresh, logger):
+                        recovered = True
+                    if recovered:
+                        continue
                 raise
             return top, system
+
+    def _auto_parameterise_offenders(self, residues, logger):
+        '''Best-effort auto-parameterisation of unmatched residues during the sim
+        build, so the user need not click "Parameterise unit" in the validation
+        panel first. Groups the offenders into units (metal / covalent / free) and
+        runs the existing pipeline via ``parameterise_cmd`` best-effort (failures
+        logged, not raised). A unit that succeeds loads its template(s) and sets
+        ``isolde_template_name`` so the build retry matches it; a unit that CANNOT
+        be built (e.g. an unsupported metal such as Mo, with no bundled LJ params)
+        is left unmatched, so the retry's ``UnparameterisedResiduesError`` still
+        fires -- a parameterisation failure remains a show-stopper for sim start.
+
+        GUI-only: a headless / MCP-driven ``sim start`` is left to the existing
+        error path rather than being blocked by a (potentially slow) AM1-BCC run.
+
+        Returns True if parameterisation was attempted (caller then retries the
+        build), False otherwise.
+        '''
+        session = self.session
+        if not session.ui.is_gui or not hasattr(session, 'isolde'):
+            return False
+        names = ', '.join(sorted({r.name for r in residues}))
+        logger.info(
+            'ISOLDE: auto-parameterising unparameterised residue(s) before '
+            'starting the simulation ({}). This may be slow.'.format(names))
+        try:
+            from .amberff.parameterise import parameterise_cmd
+            from chimerax.atomic import Residues
+            parameterise_cmd(session, Residues(residues), override=True,
+                always_raise_errors=False)
+        except Exception as e:
+            logger.warning('ISOLDE: auto-parameterisation failed ({}: {}).'
+                .format(e.__class__.__name__, e))
+            return False
+        return True
 
     def _create_openmm_system(self, forcefield, top, params, residue_templates,
             residues=None):

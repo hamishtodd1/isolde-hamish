@@ -89,6 +89,16 @@ def _inter_residue_bonds(residue):
                 yield a, nb
 
 
+def _metal_involved(residue):
+    '''True if ``residue`` contains a metal atom or is covalently bonded to one --
+    the trigger to route it to the bonded metal-site pipeline first (GAFF2 cannot
+    type a metal, so these must never fall through to the covalent/free organic
+    paths).'''
+    if any(a.element.is_metal for a in residue.atoms):
+        return True
+    return any(nb.element.is_metal for a in residue.atoms for nb in a.neighbors)
+
+
 class CovalentUnit:
     '''The residues + non-standard link bonds that make up one covalent unit.
 
@@ -1134,6 +1144,164 @@ def detect_metal_site(residues, max_heavy_atoms=250):
             'on its organic framework is unlikely to converge; parameterise it '
             'externally.' % (site, site.num_heavy_atoms, max_heavy_atoms))
     return site
+
+
+def group_for_parameterisation(session, residues, max_heavy_atoms=250,
+                               forcefield=None):
+    '''Cluster residues that failed isolated template matching into the units the
+    parameterisation pipeline actually builds -- metal sites, covalent units and
+    free ligands -- WITHOUT parameterising them.
+
+    This is the classification/grouping half of :func:`parameterise_cmd` factored
+    out so the validation UI (and any future sim-build integration) share one
+    source of routing truth. It does only cheap graph/geometry work
+    (:func:`detect_metal_site` / :func:`detect_covalent_unit`); it runs no
+    ANTECHAMBER/AM1-BCC and mutates nothing in the model, so it is safe to call
+    repeatedly (e.g. every time a panel repopulates).
+
+    Routing order matches ``parameterise_cmd`` exactly: metal-involved residues
+    first, then covalently-linked residues, then free ligands. Each ``detect_*``
+    is called with ``max_heavy_atoms=inf`` so its size guard never fires; the only
+    ``UserError`` it can then raise is the "wrong kind" signal (no metal / no
+    donors / no non-standard linkage), which is caught and used purely to fall
+    through to the next category. Size is reported per unit via ``too_big``
+    (against the real ``max_heavy_atoms``), never raised -- the caller decides
+    what to do with an oversized unit.
+
+    Args:
+        residues: a single :class:`~chimerax.atomic.Residue` or an iterable of
+            them -- typically the residues that failed ``assignTemplates``
+            (unmatched + ambiguous).
+        max_heavy_atoms: the real AM1-BCC size ceiling used to compute ``too_big``
+            for metal/covalent units (free ligands fragment internally for
+            charging and are never size-flagged).
+        forcefield: the live OpenMM ForceField, used ONLY for the cheap
+            unsupported-metal pre-check (see ``unsupported`` below). ``None``
+            skips that check (nothing is flagged unsupported).
+
+    Returns:
+        ``list[dict]``, one descriptor per unit, each with keys:
+
+        * ``kind``            -- ``'metal'`` | ``'covalent'`` | ``'free'``
+        * ``residues``        -- every member ``Residue`` (incl. context pulled in
+          by ``detect_*``, e.g. a coordinating His or a capped partner)
+        * ``seed``            -- a representative member to hand a ``parameterise_*``
+          call
+        * ``unit``            -- the :class:`MetalSite` / :class:`CovalentUnit`
+          object (``None`` for a free ligand)
+        * ``num_heavy_atoms`` -- heavy-atom count of the whole unit
+        * ``too_big``         -- ``num_heavy_atoms > max_heavy_atoms`` (metal/
+          covalent only; always ``False`` for free)
+        * ``had_neighbours``  -- whether the seed has any inter-residue bond (lets
+          ``parameterise_cmd`` reproduce its warn-and-drop for a has-neighbours
+          residue with no non-standard linkage)
+        * ``unsupported``     -- for a resolved metal site whose metal(s) ISOLDE
+          has no bundled LJ parameters for (e.g. Mo), a human-readable reason
+          string; ``None`` otherwise (and always ``None`` when ``forcefield`` is
+          not given). Such a site cannot be built, so callers should refuse it up
+          front rather than after a slow AM1-BCC run.
+
+        Every input residue appears in exactly one descriptor.
+    '''
+    from chimerax.core.errors import UserError
+    from chimerax.atomic import Residue
+
+    if isinstance(residues, Residue):
+        residues = [residues]
+    else:
+        residues = list(residues)
+    # Solvent (water) is handled by ISOLDE's water model, never by this pipeline.
+    # Drop it as a parameterisation SEED so it is never offered/attempted -- H-less
+    # crystal waters otherwise fail signature matching and would flood the list. A
+    # water that actually coordinates a metal is still pulled into that metal site
+    # as a donor by detect_metal_site; this only suppresses standalone waters.
+    residues = [r for r in residues if r.name not in _SOLVENT]
+    INF = float('inf')
+    groups = []
+    handled = set()
+
+    # 1. Metal sites first -- a residue that contains or coordinates a metal. A
+    # metal-involved residue stays in the 'metal' category even if detection
+    # fails (unit=None + error), so it can NEVER be re-classified as covalent and
+    # misrouted to GAFF2 (which has no metal type).
+    for r in residues:
+        if r in handled or not _metal_involved(r):
+            continue
+        handled.add(r)
+        try:
+            site = detect_metal_site(r, max_heavy_atoms=INF)
+        except UserError as e:
+            groups.append(dict(
+                kind='metal', residues=[r], seed=r, unit=None,
+                num_heavy_atoms=sum(1 for a in r.atoms if a.element.number != 1),
+                too_big=False, had_neighbours=len(r.neighbors) != 0,
+                error=str(e), unsupported=None))
+            continue
+        handled.update(site.residues)
+        n = site.num_heavy_atoms
+        # Cheap pre-check: a site whose metal(s) ISOLDE has no bundled LJ
+        # parameters for (e.g. Mo) cannot be built -- flag it now so callers
+        # refuse it up front rather than after a slow AM1-BCC run.
+        bad = sorted({m.element.name for m in site.metals
+                      if not _metal_lj_supported(forcefield, m)})
+        unsupported = None
+        if bad:
+            unsupported = (
+                'No bundled Lennard-Jones parameters for metal {} -- this metal '
+                'site cannot be auto-parameterised; parameterise it externally.'
+                .format('/'.join(bad)))
+        groups.append(dict(
+            kind='metal', residues=list(site.residues), seed=r, unit=site,
+            num_heavy_atoms=n, too_big=n > max_heavy_atoms,
+            had_neighbours=len(r.neighbors) != 0, error=None,
+            unsupported=unsupported))
+
+    # 2. Covalent units -- residues joined to a partner by a non-standard bond.
+    for r in residues:
+        if r in handled or len(r.neighbors) == 0:
+            continue
+        try:
+            unit = detect_covalent_unit(r, max_heavy_atoms=INF)
+        except UserError:
+            continue                      # no non-standard linkage -> free below
+        handled.update(unit.residues)
+        n = unit.num_heavy_atoms
+        groups.append(dict(
+            kind='covalent', residues=list(unit.residues), seed=r, unit=unit,
+            num_heavy_atoms=n, too_big=n > max_heavy_atoms,
+            had_neighbours=True, error=None, unsupported=None))
+
+    # 3. Everything left is a free ligand (its own single-residue "unit"). Free
+    # ligands fragment internally for AM1-BCC, so they are never size-refused.
+    for r in residues:
+        if r in handled:
+            continue
+        handled.add(r)
+        n = sum(1 for a in r.atoms if a.element.number != 1)
+        groups.append(dict(
+            kind='free', residues=[r], seed=r, unit=None,
+            num_heavy_atoms=n, too_big=False,
+            had_neighbours=len(r.neighbors) != 0, error=None, unsupported=None))
+    return groups
+
+
+def _metal_lj_supported(forcefield, metal_atom):
+    '''True if ISOLDE has bundled Lennard-Jones parameters for ``metal_atom`` (its
+    element at the guessed oxidation state) -- i.e. :func:`parameterise_metal_site`
+    could actually build a template for it. A cheap pre-check (no AM1-BCC) mirroring
+    the LJ lookup in :func:`_build_metal_terms`, so an unsupported metal (e.g. Mo,
+    absent from ISOLDE's ion set) can be refused up front. Conservatively returns
+    True when ``forcefield`` is None, or if the probe itself errors, so nothing is
+    blocked without cause (the real build then makes the authoritative call).'''
+    if forcefield is None:
+        return True
+    from .metal_params import guess_ox_state
+    try:
+        elem = metal_atom.element.name
+        ion_tmpl = _ion_template_for_element(elem, guess_ox_state(elem, None))
+        return bool(ion_tmpl) and _ion_lj(forcefield, ion_tmpl) is not None
+    except Exception:
+        return True
 
 
 def _angle_radians(a, b, c):
