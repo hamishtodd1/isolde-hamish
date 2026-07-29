@@ -19,6 +19,7 @@ class _IsoldeBasicSettings(Settings):
         'smoothing_alpha':                  defaults.SMOOTHING_ALPHA,
 
         'experience_level':                 defaults.EXPERIENCE_LEVEL,
+        'preview_camera_snap_distance':     defaults.CAMERA_SNAP_DISTANCE,
 
         'phenix_base_path':                 None,
     }
@@ -79,6 +80,21 @@ def register_settings_options(session):
                 'levels reveal additional advanced and developer controls.',
     )
     session.ui.main_window.add_settings_option('ISOLDE', opt)
+
+    from chimerax.ui.options import IntOption
+    snap_opt = IntOption(
+        'Camera fly-to distance (Å)',
+        basic_settings.preview_camera_snap_distance,
+        None,                                   # persistence is automatic
+        attr_name='preview_camera_snap_distance',
+        settings=basic_settings,
+        min=0,
+        balloon='When the view jumps to a residue (e.g. hovering a template box '
+                'in Validate → New Section), a move shorter than this animates '
+                'smoothly; a longer one snaps instantly (jump + reorient). Set to '
+                '0 to always snap.',
+    )
+    session.ui.main_window.add_settings_option('ISOLDE', snap_opt)
 
 basic_settings = None # set during bundle initialisation
 color_settings = None # set during bundle initialisation

@@ -22,8 +22,10 @@ does not touch the model. Interaction:
     camera to the residue; leaving the box drops the preview. Red is unchanged.
   * Clicking a box moves the red box and rebuilds the residue to that template
     (the grey box clears the override).
-  * Clicking the arrow cycles the grey preview to the next box (wrapping);
-    moving the mouse off the arrow commits the previewed box to the model.
+  * Hovering the arrow flies the camera to the residue. Clicking it cycles the
+    grey preview to the next box (wrapping) and reveals a green "accept" tick to
+    its left: click the tick to commit the previewed box, or move the mouse off
+    the whole row to reject (both the preview and the tick then disappear).
 
 Context-aware grouping: residues that fail template matching only because they
 are covalently modified are NOT shown one-by-one. They are clustered into the
@@ -52,7 +54,8 @@ from Qt.QtWidgets import (
     QToolButton,
     QPushButton,
 )
-from Qt.QtCore import Qt, QTimer
+from Qt.QtCore import Qt, QTimer, QEvent
+from Qt.QtGui import QCursor
 
 from ..collapse_button import CollapsibleArea
 from ..ui_base import UI_Panel_Base, DefaultVLayout, DefaultHLayout
@@ -98,6 +101,13 @@ TOOLTIP_FG = '#f0f0f0'
 # not wall-clock, assuming ~45 fps so ~40 frames ~= 0.9 s (drifts with real frame
 # rate). See navigate.ResidueStepper.step_to(easing=..., frames=...).
 TRANSITION_FRAMES = 40
+# Fallback centre-of-rotation-shift threshold (Angstroms): a hover-fly animates a
+# move shorter than this and SNAPS (jump + reorient) a longer one. This is only
+# the fallback when the ISOLDE setting is unavailable; the live, user-tweakable
+# value is the 'preview_camera_snap_distance' setting (default in
+# constants.defaults.CAMERA_SNAP_DISTANCE, exposed in ChimeraX Settings > ISOLDE),
+# read per-fly in _fly_to_residue.
+CAMERA_SNAP_DISTANCE = 50
 # Hover dwell before a box previews / flies. Approximated in ms (>~2 frames)
 # because a Qt-panel hover doesn't reliably tick the GL 'new frame' trigger.
 HOVER_PREVIEW_DELAY_MS = 50
@@ -147,18 +157,24 @@ def _residue_is_centred(residue):
 
 
 def _fly_to_residue(residue):
-    '''Smoothly move the camera to view `residue` in its standard orientation
-    (ISOLDE's ResidueStepper) with an ease-in-out curve. Skips when the residue
-    is already centred, preserving a manual reorientation.'''
+    '''Move the camera to view `residue` in its standard orientation (ISOLDE's
+    ResidueStepper). A move shorter than the configured fly-to distance (the
+    'preview_camera_snap_distance' ISOLDE setting) animates with an ease-in-out
+    curve; a longer move snaps instantly (jump + reorient) rather than flying
+    slowly across the model. Skips when the residue is already centred, preserving
+    a manual reorientation.'''
     if residue is None or residue.deleted or _residue_is_centred(residue):
         return
-    from ... import navigate
+    from ... import navigate, settings as _settings
+    snap = CAMERA_SNAP_DISTANCE
+    if _settings.basic_settings is not None:
+        snap = _settings.basic_settings.preview_camera_snap_distance
     stepper = navigate.get_stepper(residue.structure)
     stepper.step_to(
         residue,
         easing=_ease_in_out_sine,
         frames=TRANSITION_FRAMES,
-        max_interpolate_distance=float('inf')
+        max_interpolate_distance=snap
     )
 
 
@@ -281,12 +297,14 @@ class SelectableBox(QFrame):
 
 
 class ArrowButton(QToolButton):
-    '''The per-row "cycle" button. Clicking advances the grey preview to the next
-    box (wrapping); moving the mouse off the button commits the previewed box.'''
+    '''The per-row "cycle" button. Hovering it flies the camera to this residue;
+    clicking advances the grey preview to the next box (wrapping) and reveals the
+    accept button (green tick) to its left.'''
 
     def __init__(self, row, parent=None):
         super().__init__(parent)
         self.row = row
+        self._hovered = False
         self.setArrowType(Qt.RightArrow)
         self.setAutoRaise(True)
         self.setFixedSize(BOX_SIZE, BOX_SIZE)
@@ -295,28 +313,70 @@ class ArrowButton(QToolButton):
     def _clicked(self, *_):
         self.row.arrow_clicked()
 
+    def enterEvent(self, event):
+        # Hovering the arrow flies the camera to this residue, after a short dwell
+        # so a quick pass-over on the way to a box doesn't trigger a fly.
+        self._hovered = True
+        QTimer.singleShot(HOVER_PREVIEW_DELAY_MS, self._maybe_fly)
+        super().enterEvent(event)
+
     def leaveEvent(self, event):
-        try:
-            self.row.arrow_left()
-        except RuntimeError:
-            pass
+        self._hovered = False
         super().leaveEvent(event)
+
+    def _maybe_fly(self):
+        if self._hovered:
+            try:
+                self.row.hover_arrow()
+            except RuntimeError:
+                pass
+
+
+class AcceptButton(QPushButton):
+    '''Appears to the LEFT of the arrow once the arrow is clicked: a green tick
+    that commits the previewed template. Hidden otherwise, but keeps its layout
+    slot (retainSizeWhenHidden) so the row never shifts when it appears/hides.'''
+
+    def __init__(self, row, parent=None):
+        super().__init__('✓', parent)  # check mark
+        self.row = row
+        self.setFixedSize(BOX_SIZE, BOX_SIZE)
+        self.setToolTip('Accept this template')
+        self.setStyleSheet(
+            'QPushButton { background-color: #2e7d32; color: white; '
+            'font-weight: bold; border: 1px solid #1b5e20; border-radius: 3px; }'
+            'QPushButton:hover { background-color: #43a047; }'
+        )
+        sp = self.sizePolicy()
+        sp.setRetainSizeWhenHidden(True)
+        self.setSizePolicy(sp)
+        self.setVisible(False)
+        self.clicked.connect(self._clicked)
+
+    def _clicked(self, *_):
+        self.row.accept_clicked()
 
 
 class BoxRow(QWidget):
-    '''One residue's row: arrow, grey box, then viridis template boxes. Owns the
-    committed (red) and preview (grey) indices and drives the dialog's preview /
-    commit for this residue.'''
+    '''One residue's row: an accept button (hidden until the arrow is clicked),
+    the cycle arrow, the grey "no template" box, then the viridis template boxes.
+    Owns the committed (red) and preview (grey) indices and drives the dialog's
+    preview / commit for this residue.'''
 
     def __init__(self, name_cands, comp_cands, residue=None, dialog=None, parent=None):
         super().__init__(parent)
         # Held across time -- always check `.deleted` before use.
         self.residue = residue
         self._dialog = dialog
+        self._label = None  # sibling residue label widget (set via set_label)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         hl = DefaultHLayout()
         hl.setSpacing(0)  # contiguous boxes -> no dead pixels to flicker over
-        # Cycle arrow, between the residue label and the first (grey) box.
+        # Accept button (green tick) to the LEFT of the arrow -- hidden until the
+        # arrow is clicked, but keeps its slot so the row never shifts.
+        self._accept_btn = AcceptButton(self)
+        hl.addWidget(self._accept_btn)
+        # Cycle arrow, between the accept button and the first (grey) box.
         hl.addWidget(ArrowButton(self))
         self.boxes = []
         idx = 0
@@ -344,11 +404,24 @@ class BoxRow(QWidget):
         self._arrow_armed = False
         self._refresh_outlines()
 
-    # --- outline state ---------------------------------------------------
+    def set_label(self, label):
+        # The residue label lives in a separate grid cell; remember it (and watch
+        # its leave events) so "leaving the whole line" spans the label + boxes.
+        self._label = label
+        if label is not None:
+            label.installEventFilter(self)
+
+    # --- outline / armed state -------------------------------------------
     def _refresh_outlines(self):
         for i, b in enumerate(self.boxes):
             b.set_committed(i == self._committed_index)
             b.set_previewed(i == self._preview_index)
+
+    def _set_armed(self, flag):
+        # "Armed" == the arrow was clicked and the accept button is showing; the
+        # accept button's visibility tracks this flag exactly.
+        self._arrow_armed = flag
+        self._accept_btn.setVisible(flag)
 
     def _set_preview(self, index):
         self._preview_index = index
@@ -363,7 +436,7 @@ class BoxRow(QWidget):
     def clear_preview_outline(self):
         # Called by the dialog when another row takes over the single preview.
         self._preview_index = None
-        self._arrow_armed = False
+        self._set_armed(False)
         self._refresh_outlines()
 
     def _commit(self, index):
@@ -376,40 +449,84 @@ class BoxRow(QWidget):
     # --- box hover -------------------------------------------------------
     def hover_preview(self, index):
         # Hover dwell on a box: preview it (grey) and fly the camera. Red is
-        # untouched. A box hover ends any arrow-cycle.
-        self._arrow_armed = False
+        # untouched. A box hover ends any arrow-cycle (hides the accept button).
+        self._set_armed(False)
         self._set_preview(index)
         _fly_to_residue(self.residue)
 
+    def hover_arrow(self):
+        # Hovering the arrow just flies the camera to this residue; it does not
+        # touch the preview or the committed / armed state.
+        _fly_to_residue(self.residue)
+
     def leaveEvent(self, event):
-        # Mouse left the whole row -> drop the transient hover-preview. Boxes and
-        # the arrow are children, so moving among them does NOT fire this -> the
-        # preview transitions box-to-box without blanking. An armed arrow-cycle
-        # is committed by the arrow's own leave, so don't clear it here.
-        if not self._arrow_armed and self._preview_index is not None:
+        # Mouse left the box-row. The accept button, arrow and boxes are children,
+        # so moving among them does NOT fire this.
+        if self._arrow_armed:
+            # Accept button showing: reject only when the cursor leaves the WHOLE
+            # line (label + boxes), not when overshooting toward the accept button.
+            # Deferred so QCursor.pos() reflects where the mouse actually landed.
+            QTimer.singleShot(0, self._line_leave_check)
+        elif self._preview_index is not None:
+            # Transient hover-preview (no arrow-cycle) -> drop it on leaving.
             self._set_preview(None)
         super().leaveEvent(event)
 
+    def eventFilter(self, obj, event):
+        # Also watch the sibling label's leave, so parking on the label and then
+        # moving away still rejects an armed suggestion.
+        if obj is self._label and self._arrow_armed \
+                and event.type() == QEvent.Type.Leave:
+            QTimer.singleShot(0, self._line_leave_check)
+        return False
+
+    def _cursor_on_line(self):
+        # Robust "is the cursor still on this residue's line?" via widget
+        # hit-testing rather than coordinate math (which is unreliable on scaled
+        # displays): on the line iff the cursor is over the label, this box-row, or
+        # any of their descendants (accept button / arrow / boxes). Moving to
+        # another row, into the gap, or off the window all read as "off the line".
+        w = QApplication.widgetAt(QCursor.pos())
+        if w is None:
+            return False
+        if self._label is not None and (w is self._label or self._label.isAncestorOf(w)):
+            return True
+        return w is self or self.isAncestorOf(w)
+
+    def _line_leave_check(self):
+        # Deferred: reject the armed suggestion iff the cursor is now off the line.
+        try:
+            if not self._arrow_armed:
+                return
+            if self._cursor_on_line():
+                return
+            self._set_armed(False)
+            if self._preview_index is not None:
+                self._set_preview(None)
+        except RuntimeError:
+            pass  # row/label destroyed (panel torn down); nothing to do
+
     # --- box click -------------------------------------------------------
     def click(self, index):
-        # Commit: red moves here, model is rebuilt; any preview is dropped.
-        self._arrow_armed = False
+        # Commit: red moves here, model is rebuilt; any preview / arm is dropped.
+        self._set_armed(False)
         self._set_preview(None)
         self._commit(index)
 
-    # --- arrow -----------------------------------------------------------
+    # --- arrow / accept --------------------------------------------------
     def arrow_clicked(self):
-        # Advance the grey preview to the next box, wrapping. Red is untouched.
+        # Advance the grey preview to the next box, wrapping, and reveal the accept
+        # button. Red (committed) is untouched.
         start = self._committed_index if self._preview_index is None \
             else self._preview_index
-        self._arrow_armed = True
+        self._set_armed(True)
         self._set_preview((start + 1) % len(self.boxes))
 
-    def arrow_left(self):
-        # Moving off the arrow after cycling commits the previewed box.
-        if self._arrow_armed and self._preview_index is not None:
+    def accept_clicked(self):
+        # Clicking the accept tick commits the previewed box.
+        if self._preview_index is not None:
             index = self._preview_index
-            self._arrow_armed = False
+            self._set_armed(False)
             self._set_preview(None)
             self._commit(index)
 
@@ -564,8 +681,10 @@ class NewSectionDialog(UI_Panel_Base):
                     # to build a fresh template rather than show an empty box row.
                     self._add_parameterise_row(i, descriptor, label)
                 else:
-                    self._grid.addWidget(QLabel(label), i, 0, Qt.AlignmentFlag.AlignVCenter)
+                    label_w = QLabel(label)
+                    self._grid.addWidget(label_w, i, 0, Qt.AlignmentFlag.AlignVCenter)
                     row = BoxRow(name_cands, comp_cands, residue=residue, dialog=self)
+                    row.set_label(label_w)
                     self._grid.addWidget(row, i, 1, Qt.AlignmentFlag.AlignVCenter)
                     self.rows.append(row)
         except RuntimeError:
@@ -636,10 +755,13 @@ class NewSectionDialog(UI_Panel_Base):
             s.delete()
 
     def _build_preview(self, residue, template_name):
-        '''A thin-stick copy of `template_name`'s ideal structure, aligned onto
-        the residue by shared atom names and added as a child so it superimposes
-        and moves with the model. Returns the AtomicStructure, or None (any
-        failure is non-fatal -- the outline/commit logic still works).'''
+        '''A thin-stick, element-coloured (gold-carbon) copy of `template_name`'s
+        ideal structure, superimposed on the residue as a child model. The atoms
+        shared with the model are pinned onto the model's real coordinates and
+        only the template-only atoms keep the idealised geometry -- a cheap
+        half-way house between a rigid fit and a full rebuild. Returns the
+        AtomicStructure, or None (any failure is non-fatal -- the outline/commit
+        logic still works).'''
         if residue is None or residue.deleted:
             return None
         ccd_name = None
@@ -666,14 +788,32 @@ class NewSectionDialog(UI_Panel_Base):
             tmpl_pts = numpy.array([ta.coord for ta, _ in pairs])
             res_pts = numpy.array([ra.coord for _, ra in pairs])
             place, _rms = align_points(tmpl_pts, res_pts)
-            s.atoms.coords = place.transform_points(s.atoms.coords)
+            coords = place.transform_points(s.atoms.coords)
+            # Half-way house between a cheap rigid fit and a full rebuild: the atoms
+            # this template shares with the model are already in the model exactly
+            # where the preview sits, so pin those onto the model's real coordinates.
+            # Only the template-only atoms (the parts that would actually change)
+            # keep the idealised geometry, carried along by the rigid fit -- so the
+            # preview is anchored to reality at every shared atom while staying quick.
+            for i, atom in enumerate(s.atoms):
+                model_atom = res_by_name.get(atom.name)
+                if model_atom is not None:
+                    coords[i] = model_atom.coord
+            s.atoms.coords = coords
             s.name = 'template preview'
             s.pickable = False
             s.atoms.draw_modes = Atom.STICK_STYLE
             s.atoms.radii = PREVIEW_STICK_RADIUS
-            s.atoms.colors = PREVIEW_COLOR
+            # Colour by element so the preview reads as a real molecule, but keep
+            # carbons gold so it stays identifiable as a (thin-stick) preview over
+            # the model. Bonds use half-bond colouring to follow their two atoms.
+            from chimerax.atomic.colors import element_colors
+            s.atoms.colors = element_colors(s.atoms.element_numbers)
+            carbons = s.atoms[s.atoms.element_numbers == 6]
+            if len(carbons):
+                carbons.colors = PREVIEW_COLOR
             s.bonds.radii = PREVIEW_STICK_RADIUS
-            s.bonds.colors = PREVIEW_COLOR
+            s.bonds.halfbonds = True
             residue.structure.add([s])
             self._preview_buildable[ccd_name] = True
             return s
