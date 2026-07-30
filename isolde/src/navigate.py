@@ -231,24 +231,27 @@ class ResidueStepper(State):
             centroid = target_coords.mean(axis=0)
         elif pt == Residue.PT_AMINO:
             ref_coords = self.peptide_ref_coords
-            try:
-                target_coords = Atoms([r.find_atom(name) for name in ('N', 'CA', 'C')]).coords
+            # find_atom returns None for a missing atom, and Atoms([..., None])
+            # raises AttributeError (not ValueError) -- so check explicitly rather
+            # than relying on an except. A key backbone atom can be absent for an
+            # incomplete or modified residue, or a special residue e.g. NH2; fall
+            # back to a centroid framing with no preferred orientation.
+            key_atoms = [r.find_atom(name) for name in ('N', 'CA', 'C')]
+            if None not in key_atoms:
+                target_coords = Atoms(key_atoms).coords
                 centroid = target_coords[1]
-            except ValueError:
-                # Either a key atom is missing, or this is a special residue
-                # e.g. NH2
-                ref_coords=None
+            else:
+                ref_coords = None
                 target_coords = r.atoms.coords
                 centroid = target_coords.mean(axis=0)
         elif pt == Residue.PT_NUCLEIC:
             ref_coords = self.nucleic_ref_coords
-            try:
-                target_coords = Atoms(
-                    [r.find_atom(name) for name in ("C2'", "C1'", "O4'")]
-                ).coords
-                centroid=target_coords[1]
-            except ValueError:
-                ref_coords=None
+            key_atoms = [r.find_atom(name) for name in ("C2'", "C1'", "O4'")]
+            if None not in key_atoms:
+                target_coords = Atoms(key_atoms).coords
+                centroid = target_coords[1]
+            else:
+                ref_coords = None
                 target_coords = r.atoms.coords
                 centroid = target_coords.mean(axis=0)
 
