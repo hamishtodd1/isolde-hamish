@@ -75,7 +75,9 @@ class TwoColorButton(ColorButton):
             else:
                 colors = []
                 for color in self._color:
-                    colors.append([int((c + 218)/2) for c in color])
+                    # int(c) first: self._color is uint8, so a bare c + 218
+                    # overflows for c > 37 (warning + wrong shade under numpy 2.x).
+                    colors.append([int((int(c) + 218) / 2) for c in color])
             self._set_stylesheet(colors)
 
 
@@ -150,7 +152,9 @@ class ThreeColorButton(ColorButton):
             else:
                 colors = []
                 for color in self._color:
-                    colors.append([int((c + 218)/2) for c in color])
+                    # int(c) first: self._color is uint8, so a bare c + 218
+                    # overflows for c > 37 (warning + wrong shade under numpy 2.x).
+                    colors.append([int((int(c) + 218) / 2) for c in color])
             self._set_stylesheet(colors)
 
 
