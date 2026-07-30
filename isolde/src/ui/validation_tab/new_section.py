@@ -7,12 +7,15 @@
 # @Copyright: 2026 Tristan Croll
 '''
 Scratch/prototype validation section, "next rotamer"-style. One entry per
-unparameterised residue in the selected model (labelled "<name>, chain <X>"),
-each a row of: an arrow "cycle" button, a grey "no imposed template" box, then
-one box per candidate MD template grouped "by residue name" then "by topology
-similarity", ordered best-first. Template boxes are coloured by RDKit FMCS
-overlap with the residue (green = identical, purple-blue = poor); their tooltip
-carries the "possible templates" details with that FMCS overlap.
+unparameterised residue in the selected model (labelled "<name>, chain <X>",
+preceded by a small "edit in ChemSearch" button that opens the residue in the
+ChimeraX-ChemSearch 2D structure editor -- optional sister bundle; the button is
+disabled when it is not installed), each a row of: an arrow "cycle" button, a
+grey "no imposed template" box, then one box per candidate MD template grouped
+"by residue name" then "by topology similarity", ordered best-first. Template
+boxes are coloured by RDKit FMCS overlap with the residue (green = identical,
+purple-blue = poor); their tooltip carries the "possible templates" details with
+that FMCS overlap.
 
 Two outlines: a RED box marks the committed choice (applied to the model); a GREY
 box marks a transient *preview*. A preview is a thin-stick copy of the template's
@@ -357,6 +360,51 @@ class AcceptButton(QPushButton):
         self.row.accept_clicked()
 
 
+class ChemSearchButton(QToolButton):
+    '''A compact button (leftmost in a row, just before the residue label) that
+    opens this residue in the ChimeraX-ChemSearch 2D structure editor via
+    seed_from_residue. ChemSearch is an OPTIONAL sister bundle -- ISOLDE only
+    ports its conversion code, it does not depend on it -- so when the bundle is
+    not installed the button is disabled with an explanatory tooltip rather than
+    hidden (more discoverable than a silently absent control).'''
+
+    def __init__(self, dialog, residue, available=True, parent=None):
+        super().__init__(parent)
+        self._dialog = dialog
+        self.residue = residue  # held across time -- check .deleted before use
+        self.setText('✎')  # pencil: "draw / edit this structure"
+        self.setAutoRaise(True)  # flat until hovered, matching the arrow button
+        self.setFixedSize(BOX_SIZE, BOX_SIZE)
+        if available:
+            self.setToolTip('Open this residue in the ChemSearch 2D editor')
+            self.clicked.connect(self._clicked)
+        else:
+            self.setEnabled(False)
+            self.setToolTip('ChimeraX-ChemSearch is not installed')
+
+    def _clicked(self, *_):
+        self._dialog.open_in_chemsearch(self.residue)
+
+
+class ResidueNameLabel(QLabel):
+    '''The "<name>, chain <X>" label at the start of a row. Clicking it flies the
+    camera to the residue -- so the whole line, not just the small cycle arrow, is
+    a fly-to target (the arrow still flies on hover). A pointing-hand cursor hints
+    that it is clickable.'''
+
+    def __init__(self, text, residue, parent=None):
+        super().__init__(text, parent)
+        self.residue = residue  # held across time -- _fly_to_residue checks .deleted
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            _fly_to_residue(self.residue)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class BoxRow(QWidget):
     '''One residue's row: an accept button (hidden until the arrow is clicked),
     the cycle arrow, the grey "no template" box, then the viridis template boxes.
@@ -617,6 +665,9 @@ class NewSectionDialog(UI_Panel_Base):
         self._deleted = False
         self._preview_row = None
         self._preview_structure = None
+        # Whether the optional ChimeraX-ChemSearch bundle is importable; probed
+        # once, lazily, by _chemsearch_available (None => not yet probed).
+        self._chemsearch_avail = None
         # Progressive population: rows are built one residue per event-loop turn
         # so they appear as they arrive. _build_gen invalidates an in-flight
         # incremental build if the panel is refreshed again mid-stream.
@@ -681,8 +732,8 @@ class NewSectionDialog(UI_Panel_Base):
                     # to build a fresh template rather than show an empty box row.
                     self._add_parameterise_row(i, descriptor, label)
                 else:
-                    label_w = QLabel(label)
-                    self._grid.addWidget(label_w, i, 0, Qt.AlignmentFlag.AlignVCenter)
+                    cell, label_w = self._label_cell(label, residue)
+                    self._grid.addWidget(cell, i, 0, Qt.AlignmentFlag.AlignVCenter)
                     row = BoxRow(name_cands, comp_cands, residue=residue, dialog=self)
                     row.set_label(label_w)
                     self._grid.addWidget(row, i, 1, Qt.AlignmentFlag.AlignVCenter)
@@ -697,11 +748,43 @@ class NewSectionDialog(UI_Panel_Base):
 
     def _add_parameterise_row(self, i, descriptor, label):
         '''A label + a ParameteriseRow (the "build a fresh template for this whole
-        unit" action) at grid row `i`.'''
-        self._grid.addWidget(QLabel(label), i, 0, Qt.AlignmentFlag.AlignVCenter)
+        unit" action) at grid row `i`. The ChemSearch edit button targets the
+        unit's seed (the ligand for a covalent unit / free ligand; a metal-involved
+        residue for a metal site, from which ChemSearch simply derives nothing).'''
+        cell, _label_w = self._label_cell(label, descriptor['seed'])
+        self._grid.addWidget(cell, i, 0, Qt.AlignmentFlag.AlignVCenter)
         row = ParameteriseRow(descriptor, dialog=self)
         self._grid.addWidget(row, i, 1, Qt.AlignmentFlag.AlignVCenter)
         self.rows.append(row)
+
+    def _label_cell(self, label_text, residue):
+        '''Column-0 cell for a row: a compact "edit in ChemSearch" button followed
+        by the residue label. Returns (cell_widget, label_widget) -- the label is
+        returned separately because a BoxRow watches its leave events (set_label).
+        `residue` is the row's representative residue (a free ligand, or a unit's
+        seed) handed to the ChemSearch editor.'''
+        cell = QWidget()
+        hl = DefaultHLayout()
+        hl.setSpacing(4)
+        hl.addWidget(ChemSearchButton(self, residue, available=self._chemsearch_available()))
+        label_w = ResidueNameLabel(label_text, residue)
+        hl.addWidget(label_w)
+        hl.addStretch()
+        cell.setLayout(hl)
+        return cell, label_w
+
+    def _chemsearch_available(self):
+        '''Whether the optional ChimeraX-ChemSearch bundle is importable (probed
+        once and cached). ISOLDE does not depend on ChemSearch -- it only ports its
+        conversion code -- so the per-row editor button is enabled only when the
+        bundle is actually installed. find_spec does not execute the module, so the
+        probe is cheap and side-effect-free.'''
+        if self._chemsearch_avail is None:
+            import importlib.util
+            self._chemsearch_avail = (
+                importlib.util.find_spec('chimerax.chemsearch') is not None
+            )
+        return self._chemsearch_avail
 
     @staticmethod
     def _unit_label(descriptor):
@@ -898,6 +981,37 @@ class NewSectionDialog(UI_Panel_Base):
             QApplication.restoreOverrideCursor()
             self.session.logger.status('')
         self._refresh()
+
+    def open_in_chemsearch(self, residue):
+        '''Open `residue` in the ChimeraX-ChemSearch 2D structure editor: fetch (or
+        create) its singleton panel and seed it from the residue. ChemSearch derives
+        the 2D structure itself from the residue's atoms/bonds -- no conversion is
+        needed here. Best-effort: a missing bundle, a deleted residue, or one
+        ChemSearch cannot derive a structure from (e.g. a lone metal ion) is a
+        logged warning, never an error. NOTE this replaces whatever is currently
+        drawn in the shared ChemSearch panel.'''
+        if residue is None or residue.deleted:
+            return
+        try:
+            from chimerax.core.tools import get_singleton
+            from chimerax.chemsearch import TOOL_NAME
+            from chimerax.chemsearch.tool import ChemSearchTool
+        except ImportError:
+            self.session.logger.warning(
+                'ChimeraX-ChemSearch is not installed; cannot open the structure '
+                'editor.'
+            )
+            return
+        try:
+            tool = get_singleton(self.session, ChemSearchTool, TOOL_NAME)
+            if tool is not None:
+                tool.seed_from_residue(residue)
+        except Exception as e:
+            self.session.logger.warning(
+                'New section: could not open {} in ChemSearch ({}: {})'.format(
+                    residue.name, e.__class__.__name__, e
+                )
+            )
 
     # --- data (FMCS-scored candidate templates) --------------------------
     def _detect(self):
