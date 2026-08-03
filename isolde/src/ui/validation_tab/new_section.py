@@ -57,8 +57,7 @@ from Qt.QtWidgets import (
     QToolButton,
     QPushButton,
 )
-from Qt.QtCore import Qt, QTimer, QEvent
-from Qt.QtGui import QCursor
+from Qt.QtCore import Qt, QTimer
 
 from ..collapse_button import CollapsibleArea
 from ..ui_base import UI_Panel_Base, DefaultVLayout, DefaultHLayout
@@ -69,7 +68,11 @@ from matplotlib import colormaps
 
 _VIRIDIS = colormaps['viridis']
 
-BOX_SIZE = 20  # px, each box is a fixed square
+BOX_SIZE = 20  # px; row controls are BOX_SIZE squares, and it sets the box height
+# Suggestion boxes (candidate templates + the grey "no template" box) are half the
+# control width but full height, so more candidates fit per line while staying
+# aligned with -- and not shrinking -- the arrow/accept/edit buttons.
+BOX_WIDTH = BOX_SIZE // 2
 # Gap between the three box groups (no-template | name-match | topology-match).
 # Within a group boxes are contiguous (row spacing 0); the gap only sits between
 # groups. It no longer causes hover flicker -- crossing it stays inside the row,
@@ -121,18 +124,36 @@ HOVER_PREVIEW_DELAY_MS = 50
 # (~0 deg), and rotating about the centre-of-rotation keeps it there, so this
 # still suppresses re-rotation when you are already looking straight at it.
 CAMERA_CENTERED_FRACTION = 0.03
+# A listed residue is treated as "the one the camera is focused on" -- underlined,
+# and the one whose preview is kept -- while its framing point is within this many
+# Angstroms of the centre of rotation. Below the ~3.8 A CA-CA spacing so adjacent
+# residues are still distinguished; a real navigation moves the CofR further.
+COFR_MATCH_DISTANCE = 2.5
 # FMCS is NP-hard; cap each residue-vs-template comparison so a large/symmetric
 # residue can't stall the panel. RDKit returns its best match so far on timeout.
 FMCS_TIMEOUT_S = 2
-# Preview thin-stick appearance.
+# Preview thin-stick appearance. (Carbons are painted with the model's own carbon
+# colour at build time -- see NewSectionDialog._model_carbon_color.)
 PREVIEW_STICK_RADIUS = 0.05
-PREVIEW_COLOR = (255, 215, 0, 255)  # gold, to read clearly over the model
 
 
 def _ease_in_out_sine(t):
     '''Ease-in-out on a fraction t in [0, 1]: zero derivative (hence zero
     linear and angular camera velocity) at both ends, peak rate at the middle.'''
     return (1.0 - cos(pi * t)) / 2.0
+
+
+def _framing_point(residue):
+    '''The residue's framing point in SCENE coordinates -- the CA for an amino
+    acid, C1' for a nucleotide, else the atom centroid -- matching what
+    ResidueStepper centres on. None if the residue has no atoms.'''
+    import numpy
+    atoms = residue.atoms
+    if not len(atoms):
+        return None
+    ref = residue.find_atom('CA') or residue.find_atom("C1'")
+    pt = ref.scene_coord if ref is not None else atoms.scene_coords.mean(axis=0)
+    return numpy.asarray(pt, dtype=float)
 
 
 def _residue_is_centred(residue):
@@ -159,14 +180,32 @@ def _residue_is_centred(residue):
     return perp / depth < CAMERA_CENTERED_FRACTION
 
 
+def _select_residue(residue):
+    '''Make `residue` the current selection within its own model: deselect that
+    model's atoms/bonds, then select the residue's atoms and their intra-residue
+    bonds. Matches ISOLDE's own "focus an offending residue" idiom
+    (isolde._handle_bad_template) and is scoped to the residue's structure, so a
+    selection in any other open model is left untouched.'''
+    m = residue.structure
+    m.atoms.selected = False
+    m.bonds.selected = False
+    residue.atoms.selected = True
+    residue.atoms.intra_bonds.selected = True
+
+
 def _fly_to_residue(residue):
     '''Move the camera to view `residue` in its standard orientation (ISOLDE's
-    ResidueStepper). A move shorter than the configured fly-to distance (the
-    'preview_camera_snap_distance' ISOLDE setting) animates with an ease-in-out
-    curve; a longer move snaps instantly (jump + reorient) rather than flying
-    slowly across the model. Skips when the residue is already centred, preserving
-    a manual reorientation.'''
-    if residue is None or residue.deleted or _residue_is_centred(residue):
+    ResidueStepper) AND make it the current selection (_select_residue). A move
+    shorter than the configured fly-to distance (the 'preview_camera_snap_distance'
+    ISOLDE setting) animates with an ease-in-out curve; a longer move snaps
+    instantly (jump + reorient) rather than flying slowly across the model. The
+    camera move is skipped when the residue is already centred (preserving a manual
+    reorientation), but the selection still happens -- the residue was chosen, so
+    it is selected whether or not the camera actually moves.'''
+    if residue is None or residue.deleted:
+        return
+    _select_residue(residue)
+    if _residue_is_centred(residue):
         return
     from ... import navigate, settings as _settings
     snap = CAMERA_SNAP_DISTANCE
@@ -219,9 +258,10 @@ def _match_tooltip(kind, tname, fraction, ccd_name, description):
 
 
 class SelectableBox(QFrame):
-    '''A fixed-size coloured square for one candidate template (or the grey "no
-    imposed template" box). Reports clicks/hovers to its BoxRow. Carries two
-    independent outline states: committed (red) and previewed (grey); red wins.'''
+    '''A fixed-size coloured box (BOX_WIDTH x BOX_SIZE -- half-width, full height)
+    for one candidate template (or the grey "no imposed template" box). Reports
+    clicks/hovers to its BoxRow. Carries two independent outline states: committed
+    (red) and previewed (grey); red wins.'''
 
     _COMMITTED_BORDER = '3px solid #e53935'  # red: the applied choice
     _PREVIEW_BORDER = '3px solid #9e9e9e'  # grey: the transient preview
@@ -233,7 +273,7 @@ class SelectableBox(QFrame):
         self.index = index
         self.template_name = template_name  # None for the grey "no template" box
         self._fill_css = fill_css
-        self.setFixedSize(BOX_SIZE, BOX_SIZE)
+        self.setFixedSize(BOX_WIDTH, BOX_SIZE)
         self._committed = False
         self._previewed = False
         self._hovered = False
@@ -390,12 +430,26 @@ class ResidueNameLabel(QLabel):
     '''The "<name>, chain <X>" label at the start of a row. Clicking it flies the
     camera to the residue -- so the whole line, not just the small cycle arrow, is
     a fly-to target (the arrow still flies on hover). A pointing-hand cursor hints
-    that it is clickable.'''
+    that it is clickable. The label is UNDERLINED while its residue is the one the
+    camera is currently focused on (driven by NewSectionDialog._on_frame_drawn).'''
 
     def __init__(self, text, residue, parent=None):
         super().__init__(text, parent)
         self.residue = residue  # held across time -- _fly_to_residue checks .deleted
+        self._focused = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_focused(self, flag):
+        # Underline iff this residue is currently centred in the view. Coerce to a
+        # native bool: _residue_is_centred yields a numpy.bool_, which PyQt6's
+        # setUnderline rejects.
+        flag = bool(flag)
+        if flag == self._focused:
+            return
+        self._focused = flag
+        f = self.font()
+        f.setUnderline(flag)
+        self.setFont(f)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -453,11 +507,10 @@ class BoxRow(QWidget):
         self._refresh_outlines()
 
     def set_label(self, label):
-        # The residue label lives in a separate grid cell; remember it (and watch
-        # its leave events) so "leaving the whole line" spans the label + boxes.
+        # Sibling residue label, kept for reference. It no longer drives any
+        # leave-based rejection: previews now persist until the camera's centre of
+        # rotation moves off the residue (see NewSectionDialog._on_frame_drawn).
         self._label = label
-        if label is not None:
-            label.installEventFilter(self)
 
     # --- outline / armed state -------------------------------------------
     def _refresh_outlines(self):
@@ -507,52 +560,10 @@ class BoxRow(QWidget):
         # touch the preview or the committed / armed state.
         _fly_to_residue(self.residue)
 
-    def leaveEvent(self, event):
-        # Mouse left the box-row. The accept button, arrow and boxes are children,
-        # so moving among them does NOT fire this.
-        if self._arrow_armed:
-            # Accept button showing: reject only when the cursor leaves the WHOLE
-            # line (label + boxes), not when overshooting toward the accept button.
-            # Deferred so QCursor.pos() reflects where the mouse actually landed.
-            QTimer.singleShot(0, self._line_leave_check)
-        elif self._preview_index is not None:
-            # Transient hover-preview (no arrow-cycle) -> drop it on leaving.
-            self._set_preview(None)
-        super().leaveEvent(event)
-
-    def eventFilter(self, obj, event):
-        # Also watch the sibling label's leave, so parking on the label and then
-        # moving away still rejects an armed suggestion.
-        if obj is self._label and self._arrow_armed \
-                and event.type() == QEvent.Type.Leave:
-            QTimer.singleShot(0, self._line_leave_check)
-        return False
-
-    def _cursor_on_line(self):
-        # Robust "is the cursor still on this residue's line?" via widget
-        # hit-testing rather than coordinate math (which is unreliable on scaled
-        # displays): on the line iff the cursor is over the label, this box-row, or
-        # any of their descendants (accept button / arrow / boxes). Moving to
-        # another row, into the gap, or off the window all read as "off the line".
-        w = QApplication.widgetAt(QCursor.pos())
-        if w is None:
-            return False
-        if self._label is not None and (w is self._label or self._label.isAncestorOf(w)):
-            return True
-        return w is self or self.isAncestorOf(w)
-
-    def _line_leave_check(self):
-        # Deferred: reject the armed suggestion iff the cursor is now off the line.
-        try:
-            if not self._arrow_armed:
-                return
-            if self._cursor_on_line():
-                return
-            self._set_armed(False)
-            if self._preview_index is not None:
-                self._set_preview(None)
-        except RuntimeError:
-            pass  # row/label destroyed (panel torn down); nothing to do
+    # Note: there is deliberately no leaveEvent-based rejection. A preview (and its
+    # armed accept button) persists when the mouse leaves the row; it is dropped
+    # only when the camera's centre of rotation moves off the residue, or replaced
+    # when another row is hovered (NewSectionDialog._on_frame_drawn / show_preview).
 
     # --- box click -------------------------------------------------------
     def click(self, index):
@@ -665,6 +676,28 @@ class NewSectionDialog(UI_Panel_Base):
         self._deleted = False
         self._preview_row = None
         self._preview_structure = None
+        # While a preview is shown we hide the residue it stands in for, remembering
+        # it + its atoms' display state so leaving restores exactly that. (The
+        # preview's link to its chain neighbours is drawn as stub atoms/bonds inside
+        # the preview structure itself -- see _build_preview -- so it needs no
+        # separate lifecycle here.)
+        self._hidden_residue = None
+        self._saved_displays = None
+        # Row name-labels (ResidueNameLabel), so _on_frame_drawn can underline the
+        # one whose residue sits at the centre of rotation. Rebuilt each populate.
+        self._name_labels = []
+        # Scene-coord framing point of the residue whose preview is currently shown;
+        # the preview is dropped once the centre of rotation moves away from it --
+        # but only after it has first ARRIVED there (_preview_settled), so the
+        # fly-in to a freshly-shown preview doesn't immediately discard it.
+        self._preview_center = None
+        self._preview_settled = False
+        # Cheap change-detection: the focus/preview-drop check only recomputes when
+        # the centre of rotation actually moved (its bytes differ).
+        self._last_cofr_key = None
+        self._frame_handler = self.session.triggers.add_handler(
+            'frame drawn', self._on_frame_drawn
+        )
         # Whether the optional ChimeraX-ChemSearch bundle is importable; probed
         # once, lazily, by _chemsearch_available (None => not yet probed).
         self._chemsearch_avail = None
@@ -690,6 +723,9 @@ class NewSectionDialog(UI_Panel_Base):
         # Stop the self-rescheduling _process_next build chain before our Qt
         # widgets are destroyed, then let the base class drop trigger handlers.
         self._deleted = True
+        if self._frame_handler is not None:
+            self.session.triggers.remove_handler(self._frame_handler)
+            self._frame_handler = None
         super().cleanup()
 
     def _refresh(self, *_):
@@ -701,12 +737,66 @@ class NewSectionDialog(UI_Panel_Base):
         self._dirty = False
         self._clear_rows()
         self._build_gen += 1
+        # Hydrogens are a prerequisite: template matching gates on an element
+        # signature that COUNTS hydrogens, so an unprotonated model reads as if
+        # every residue were unparameterised. Rather than flood the list with
+        # false positives, gate the whole section behind a single "Add hydrogens"
+        # action until the model is protonated.
+        m = self.isolde.selected_model
+        if m is not None and not self._model_has_hydrogens(m):
+            self._show_add_hydrogens_row()
+            self._size_scroll(1)
+            return
         # Cheap bulk step: which residues are unparameterised + their raw
         # candidate sources. The expensive per-candidate FMCS is deferred to
         # _process_next so rows appear progressively rather than all at once.
         self._pending = self._detect()
         self._size_scroll(len(self._pending))
         self._process_next(self._build_gen)
+
+    @staticmethod
+    def _model_has_hydrogens(model):
+        '''Whether `model` contains any hydrogen atoms. Used to gate the section:
+        an unprotonated model can't be meaningfully checked for unparameterised
+        residues (template matching counts H).'''
+        import numpy
+        return bool((model.atoms.element_numbers == 1).any())
+
+    def _show_add_hydrogens_row(self):
+        '''Replace the residue list with a single prominent "Add hydrogens" button
+        (shown when the model has no hydrogens -- see _refresh).'''
+        btn = QPushButton('Find unparameterized residues (will add hydrogens)')
+        btn.setStyleSheet('QPushButton { font-weight: bold; padding: 4px 10px; }')
+        btn.setToolTip(
+            'This model has no hydrogens. ISOLDE needs a fully protonated model, '
+            'and template matching counts hydrogens -- so unparameterised residues '
+            'cannot be checked until hydrogens are added.'
+        )
+        btn.clicked.connect(lambda *_: self._add_hydrogens())
+        self._grid.addWidget(btn, 0, 0, 1, 2, Qt.AlignmentFlag.AlignLeft)
+
+    def _add_hydrogens(self):
+        '''Protonate the selected model (ISOLDE's addh convention), then refresh so
+        the section can populate. Runs only on the user's explicit click.'''
+        m = self.isolde.selected_model
+        if m is None or m.deleted:
+            return
+        self.session.logger.status('Adding hydrogens...')
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            from chimerax.atomic import AtomicStructures
+            from chimerax.addh import cmd as addh_cmd
+            addh_cmd.cmd_addh(self.session, AtomicStructures([m]), hbond=True)
+        except Exception as e:
+            self.session.logger.warning(
+                'New section: could not add hydrogens ({}: {})'.format(
+                    e.__class__.__name__, e
+                )
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.session.logger.status('')
+        self._refresh()
 
     def _process_next(self, gen):
         # Build one entry's row per event-loop turn (so each paints as it lands),
@@ -768,6 +858,7 @@ class NewSectionDialog(UI_Panel_Base):
         hl.setSpacing(4)
         hl.addWidget(ChemSearchButton(self, residue, available=self._chemsearch_available()))
         label_w = ResidueNameLabel(label_text, residue)
+        self._name_labels.append(label_w)  # for the camera-focus underline
         hl.addWidget(label_w)
         hl.addStretch()
         cell.setLayout(hl)
@@ -813,6 +904,7 @@ class NewSectionDialog(UI_Panel_Base):
                 w.setParent(None)
                 w.deleteLater()
         self.rows = []
+        self._name_labels = []
 
     # --- preview management (one superimposed preview at a time) ----------
     def show_preview(self, row, template_name):
@@ -823,6 +915,29 @@ class NewSectionDialog(UI_Panel_Base):
         self._preview_row = row
         if template_name is not None:
             self._preview_structure = self._build_preview(row.residue, template_name)
+            if self._preview_structure is not None:
+                # Hide the whole residue so the preview stands in for it cleanly --
+                # no model atoms (templated or not) showing under/around it. The
+                # residue's own bonds to its neighbours hide with it, so the chain
+                # link is redrawn as stub atoms/bonds in _build_preview.
+                self._hide_replaced(row.residue)
+                # Remember where this residue sits so _on_frame_drawn can drop the
+                # preview once the centre of rotation moves off it. Seed "settled"
+                # from the CURRENT CofR: if we are already centred here (the fly
+                # will be skipped, so the CofR won't change to re-arm it) the drop
+                # is armed immediately; otherwise it arms when the fly-in arrives.
+                self._preview_center = _framing_point(row.residue)
+                self._preview_settled = False
+                try:
+                    import numpy
+                    c = self.session.main_view.center_of_rotation
+                    self._preview_settled = (
+                        self._preview_center is not None and c is not None and numpy.linalg.
+                        norm(numpy.asarray(c, dtype=float) - self._preview_center)
+                        < COFR_MATCH_DISTANCE
+                    )
+                except Exception:
+                    pass
 
     def remove_preview(self, row=None):
         # Ignore stale calls from a row that no longer owns the preview.
@@ -832,13 +947,130 @@ class NewSectionDialog(UI_Panel_Base):
         self._preview_row = None
 
     def _delete_preview_structure(self):
+        self._restore_replaced()
+        self._preview_center = None
+        self._preview_settled = False
         s = self._preview_structure
         self._preview_structure = None
         if s is not None and not s.deleted:
-            s.delete()
+            s.delete()  # also removes the in-structure chain-link stub atoms/bonds
+
+    def _drop_preview(self):
+        # Fully drop the current preview: clear the owning row's grey outline and
+        # armed accept button, then remove the structure. Used when the centre of
+        # rotation moves off the previewed residue (the preview is no longer
+        # discarded on a mere mouse-leave).
+        row = self._preview_row
+        if row is not None:
+            try:
+                row.clear_preview_outline()
+            except RuntimeError:
+                pass
+        self.remove_preview()
+
+    def _hide_replaced(self, residue):
+        '''Hide the residue's atoms (and, with them, their bonds) while its preview
+        is shown, so the preview stands in for it cleanly -- no model atoms left
+        showing under/around the preview. Remembers the exact per-atom display
+        state so _restore_replaced puts it back. Uses `displays` (not a hide bit)
+        so it composes cleanly with spotlight masking (the separate `hides`
+        bitmask). The residue's bonds to its neighbours hide with it, so
+        _build_preview redraws that link as preview->neighbour pseudobonds.'''
+        if residue is None or residue.deleted:
+            return
+        atoms = residue.atoms
+        self._hidden_residue = residue
+        self._saved_displays = atoms.displays  # snapshot (a fresh array)
+        atoms.displays = False
+
+    def _restore_replaced(self):
+        '''Undo _hide_replaced. Re-fetches by the stored residue and checks it is
+        alive + unchanged in size before restoring the saved display state; if the
+        atom set changed under us (a live edit), best-effort show everything.'''
+        r = self._hidden_residue
+        saved = self._saved_displays
+        self._hidden_residue = None
+        self._saved_displays = None
+        if r is None or r.deleted or saved is None:
+            return
+        atoms = r.atoms
+        if len(atoms) == len(saved):
+            atoms.displays = saved
+        else:
+            atoms.displays = True
+
+    def _on_frame_drawn(self, *_):
+        '''On each drawn frame -- but only when the centre of rotation actually
+        moved (O(1) otherwise) -- (a) underline the listed residue now sitting at
+        the centre of rotation, and (b) drop the current preview once the centre of
+        rotation has moved off the residue it previews. Previews persist across
+        mouse-leaves now; moving the view away is what discards them.'''
+        if self._deleted or self.container.is_collapsed:
+            return
+        import numpy
+        try:
+            cofr = self.session.main_view.center_of_rotation
+        except Exception:
+            return
+        cofr = None if cofr is None else numpy.asarray(cofr, dtype=float)
+        key = b'' if cofr is None else cofr.tobytes()
+        if key == self._last_cofr_key:
+            return
+        self._last_cofr_key = key
+        # (a) underline the residue whose framing point is at the centre of rotation
+        for lbl in self._name_labels:
+            r = lbl.residue
+            focused = False
+            if cofr is not None and r is not None and not r.deleted:
+                fp = _framing_point(r)
+                focused = fp is not None and \
+                    numpy.linalg.norm(fp - cofr) < COFR_MATCH_DISTANCE
+            try:
+                lbl.set_focused(focused)
+            except RuntimeError:
+                pass  # label destroyed under us; next populate rebuilds the list
+        # (b) drop the kept preview once the centre of rotation leaves its residue,
+        # but only after it has first arrived there (so the fly-in, which sweeps the
+        # CofR in from afar, doesn't discard the preview it just created).
+        if self._preview_center is not None and cofr is not None:
+            if numpy.linalg.norm(cofr - self._preview_center) < COFR_MATCH_DISTANCE:
+                self._preview_settled = True
+            elif self._preview_settled:
+                self._drop_preview()
+
+    def _leaving_atom_names(self, ccd_name):
+        '''CCD atom names flagged ``pdbx_leaving_atom_flag == 'Y'`` for `ccd_name`
+        (empty set if unavailable). Read from ChemComp's full record, which keeps
+        the flag that ccd_records/lookup drop (they return 4-tuples).'''
+        try:
+            from chimerax.chemcomp import record
+            rec = record(self.session, ccd_name)
+        except Exception:
+            return set()
+        if isinstance(rec, dict):
+            atoms = rec.get('atoms')
+            if atoms:
+                return {a[0] for a in atoms if len(a) > 5 and a[5] == 'Y'}
+        return set()
+
+    @staticmethod
+    def _model_carbon_color(residue):
+        '''The model's carbon colour, used to paint the preview's carbons so it
+        reads as part of the model. Prefers this residue's own carbons, then any
+        carbon in the structure, then the element default.'''
+        import numpy
+        from chimerax.atomic.colors import element_colors
+        c = residue.atoms[residue.atoms.element_numbers == 6]
+        if len(c):
+            return c.colors[0]
+        sc = residue.structure.atoms
+        sc = sc[sc.element_numbers == 6]
+        if len(sc):
+            return sc.colors[0]
+        return element_colors(numpy.array([6]))[0]
 
     def _build_preview(self, residue, template_name):
-        '''A thin-stick, element-coloured (gold-carbon) copy of `template_name`'s
+        '''A thin-stick, element-coloured (model-carbon) copy of `template_name`'s
         ideal structure, superimposed on the residue as a child model. The atoms
         shared with the model are pinned onto the model's real coordinates and
         only the template-only atoms keep the idealised geometry -- a cheap
@@ -868,35 +1100,142 @@ class NewSectionDialog(UI_Panel_Base):
                 s.delete()
                 self._preview_buildable[ccd_name] = False
                 return None
+            # The fit uses the residue's shared atoms; the shared backbone (N, CA,
+            # C) is pinned to the model's real coordinates below, which already
+            # anchors the preview onto the true chain (its N/C ARE the chain's
+            # connection points). No extra neighbour anchor is needed -- and a free
+            # monomer's leaving atoms sit at the template's idealised dihedral, not
+            # this chain's, so using them as anchors would fight the backbone fit.
             tmpl_pts = numpy.array([ta.coord for ta, _ in pairs])
             res_pts = numpy.array([ra.coord for _, ra in pairs])
             place, _rms = align_points(tmpl_pts, res_pts)
             coords = place.transform_points(s.atoms.coords)
+            rigid = coords.copy()  # rigid-fit positions, before any pinning
+            index_by_atom = {a: i for i, a in enumerate(s.atoms)}
             # Half-way house between a cheap rigid fit and a full rebuild: the atoms
             # this template shares with the model are already in the model exactly
             # where the preview sits, so pin those onto the model's real coordinates.
-            # Only the template-only atoms (the parts that would actually change)
-            # keep the idealised geometry, carried along by the rigid fit -- so the
-            # preview is anchored to reality at every shared atom while staying quick.
+            placed = set()
             for i, atom in enumerate(s.atoms):
                 model_atom = res_by_name.get(atom.name)
                 if model_atom is not None:
                     coords[i] = model_atom.coord
+                    placed.add(i)
+            # Re-attach the template-only atoms (no model twin) to that pinned
+            # frame. Most are hydrogens whose name differs between the model and the
+            # CCD, so they never name-match -- and, left at their idealised rigid-fit
+            # position, they float away from a heavy neighbour that WAS pinned to a
+            # different (real, often distorted) model coordinate. Carry each along by
+            # the model-space shift of an already-placed neighbour, propagating
+            # outward so a missing heavy atom AND the hydrogens hanging off it both
+            # follow. rigid[i] - rigid[anchor] is their bond vector in the fitted
+            # frame, so adding it to the anchor's placed position rebuilds the local
+            # geometry off the real atom.
+            pending = [i for i in range(len(s.atoms)) if i not in placed]
+            progress = True
+            while pending and progress:
+                progress, still = False, []
+                for i in pending:
+                    anchor = next(
+                        (index_by_atom[nb] for nb in s.atoms[i].neighbors
+                         if index_by_atom[nb] in placed), None
+                    )
+                    if anchor is None:
+                        still.append(i)
+                        continue
+                    coords[i] = coords[anchor] + (rigid[i] - rigid[anchor])
+                    placed.add(i)
+                    progress = True
+                pending = still
             s.atoms.coords = coords
             s.name = 'template preview'
             s.pickable = False
             s.atoms.draw_modes = Atom.STICK_STYLE
             s.atoms.radii = PREVIEW_STICK_RADIUS
-            # Colour by element so the preview reads as a real molecule, but keep
-            # carbons gold so it stays identifiable as a (thin-stick) preview over
-            # the model. Bonds use half-bond colouring to follow their two atoms.
+            # Colour by element, with carbons taking the MODEL's carbon colour so
+            # the preview reads as a natural extension of the chain rather than a
+            # distinct overlay. Bonds use half-bond colouring to follow their atoms.
             from chimerax.atomic.colors import element_colors
             s.atoms.colors = element_colors(s.atoms.element_numbers)
             carbons = s.atoms[s.atoms.element_numbers == 6]
             if len(carbons):
-                carbons.colors = PREVIEW_COLOR
+                carbons.colors = self._model_carbon_color(residue)
             s.bonds.radii = PREVIEW_STICK_RADIUS
             s.bonds.halfbonds = True
+            # The residue is hidden while its preview shows, so its own bonds to the
+            # neighbouring residues vanish. Redraw that link with short stub bonds
+            # INSIDE the preview structure: for each preview atom whose model twin
+            # bonds across a residue boundary, add a marker atom at the real
+            # neighbour's coordinate and bond the preview atom to it. Keeping both
+            # ends inside the (displayed) preview means the link always draws --
+            # unlike a pseudobond, whose model-side endpoint may be ribbon-hidden.
+            # Best-effort: on any failure the preview simply has no link stubs.
+            try:
+                import numpy
+                from chimerax.atomic.struct_edit import add_atom, add_bond
+                prev_by_name = {a.name: a for a in s.atoms}
+                link_color = self._model_carbon_color(residue)
+                idx = 0
+                linked_pa = []
+                for ra in residue.atoms:
+                    pa = prev_by_name.get(ra.name)
+                    if pa is None:
+                        continue
+                    ext = [
+                        nb for nb in ra.neighbors
+                        if nb.residue is not residue and nb.element.number != 1
+                    ]
+                    for nb in ext:
+                        stub = add_atom('lnk%d' % idx, nb.element, tmpl_res, nb.coord)
+                        idx += 1
+                        stub.draw_mode = Atom.STICK_STYLE
+                        stub.radius = PREVIEW_STICK_RADIUS
+                        stub.color = link_color
+                        b = add_bond(pa, stub)
+                        b.radius = PREVIEW_STICK_RADIUS
+                        b.color = link_color
+                    if ext:
+                        linked_pa.append(pa)
+                # (1a) Hide the leaving atoms at each linked position -- the peptide
+                # bond replaces them, so they are absent from the polymer form. BFS
+                # out from each linked atom through leaving-flagged atoms (OXT, then
+                # its HXT, ...); leaving atoms at UNLINKED positions (e.g. a real
+                # C-terminal OXT) are not reached and stay visible.
+                leaving = self._leaving_atom_names(ccd_name)
+                if leaving and linked_pa:
+                    hide, frontier = set(), list(linked_pa)
+                    while frontier:
+                        a = frontier.pop()
+                        for nb in a.neighbors:
+                            if nb.name in leaving and nb not in hide:
+                                hide.add(nb)
+                                frontier.append(nb)
+                    for a in hide:
+                        a.display = False
+                # (1b) Flatten linked amide nitrogens: the free monomer's N is a
+                # pyramidal sp3 amine, but in the polymer it is a planar sp2 amide.
+                # Put the single remaining N-H in the plane of N's two heavy
+                # neighbours, opposite their bisector (~sp2).
+                for pa in linked_pa:
+                    if pa.element.number != 7:
+                        continue
+                    heavy = [
+                        nb for nb in pa.neighbors if nb.element.number != 1 and nb.display
+                    ]
+                    hs = [nb for nb in pa.neighbors if nb.element.number == 1 and nb.display]
+                    if len(heavy) < 2 or len(hs) != 1:
+                        continue
+                    n = numpy.asarray(pa.coord, dtype=float)
+                    d1 = numpy.asarray(heavy[0].coord, dtype=float) - n
+                    d2 = numpy.asarray(heavy[1].coord, dtype=float) - n
+                    d1 /= (numpy.linalg.norm(d1) or 1.0)
+                    d2 /= (numpy.linalg.norm(d2) or 1.0)
+                    bis = d1 + d2
+                    bl = numpy.linalg.norm(bis)
+                    if bl >= 1e-6:
+                        hs[0].coord = n - bis / bl * 1.01
+            except Exception:
+                pass
             residue.structure.add([s])
             self._preview_buildable[ccd_name] = True
             return s
