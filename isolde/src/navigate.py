@@ -71,6 +71,12 @@ class ResidueStepper(State):
     DEFAULT_INTERPOLATE_FRAMES=15
     DEFAULT_MAX_INTERPOLATE_DISTANCE=10
     DEFAULT_VIEW_DISTANCE=10
+    # When a residue is too big to fit at DEFAULT_VIEW_DISTANCE, _new_camera_position
+    # grows the view distance until the residue's atoms fit both the field of view
+    # and the clip slab (see there). Padding keeps atoms just off the edge/planes;
+    # the cap stops a pathologically large residue flying the camera to infinity.
+    CAMERA_FIT_PADDING=1.1
+    CAMERA_FIT_MAX_DISTANCE=200
     DEFAULT_DIRECTION="next"
     '''
     Provide methods to step forward/backward through the polymeric residues in
@@ -267,14 +273,51 @@ class ResidueStepper(State):
             from chimerax.geometry import Place
             p = Place(origin=centroid)
 
-        tc = self._camera_ref_pos(self.view_distance)
+        # Expand the framing so THIS residue's atoms actually fit. The fixed default
+        # view distance frames a typical residue well, but a large one (a bulky
+        # ligand or a modified residue) overflows the field of view and/or the thin
+        # clip slab and comes out half off-screen or clipped. Measure the atoms'
+        # extent about the look-at point (~centroid), split into lateral (bounded by
+        # the field width = 2*vd) and depth (bounded by the clip slab), and grow the
+        # view distance until both are contained. The slab thickens with distance
+        # (see _clip_slab_half), so the depth loop converges quickly. Only ever
+        # expands, so residues that already fit keep the good default zoom.
+        import numpy
+        vd = self._view_distance
+        fit_coords = residue.atoms.coords
+        if len(fit_coords):
+            # Camera look-at axis in scene coords: the ref-frame camera looks along
+            # +y (see _camera_ref_pos), so transform the y basis vector by p's
+            # rotation. Place exposes z_axis() but not y_axis(), so take it straight
+            # from the rotation matrix (its second column = image of [0, 1, 0]).
+            view_dir = numpy.asarray(p.matrix, dtype=float)[:, :3].dot(
+                numpy.array([0.0, 1.0, 0.0])
+            )
+            vlen = numpy.linalg.norm(view_dir)
+            if vlen:
+                view_dir = view_dir / vlen
+            rel = numpy.asarray(fit_coords, dtype=float) \
+                - numpy.asarray(centroid, dtype=float)
+            depth = rel.dot(view_dir)
+            lateral = numpy.linalg.norm(rel - numpy.outer(depth, view_dir), axis=1)
+            need_lat = float(lateral.max()) * self.CAMERA_FIT_PADDING
+            need_depth = float(numpy.abs(depth).max()) * self.CAMERA_FIT_PADDING
+            vd = max(vd, need_lat)
+            for _ in range(60):
+                if vd >= self.CAMERA_FIT_MAX_DISTANCE \
+                        or _clip_slab_half(session, vd) >= need_depth:
+                    break
+                vd = vd * 1.12
+            vd = min(vd, self.CAMERA_FIT_MAX_DISTANCE)
+
+        tc = self._camera_ref_pos(vd)
         np = p*tc
         new_cofr = centroid
         if c.name=='orthographic':
             fw = c.field_width
         else:
             fw = None
-        new_fw = self._view_distance*2
+        new_fw = vd*2
 
         def interpolate_camera(
             session,
@@ -463,3 +506,22 @@ def _get_clip_points(session, dist):
         zmm = mm[0]
         return (zmm.near_clip_point(o, vd*dist, dist), zmm.far_clip_point(o, vd*dist, dist))
     return (o+vd*dist*0.5, o+vd*dist*1.5)
+
+
+def _clip_slab_half(session, dist):
+    '''Half-thickness (Angstroms) of the clip slab _get_clip_points sets at a
+    camera-to-target distance `dist`. Mirrors that function so _new_camera_position
+    can predict -- and grow the view distance to widen -- the slab: with Clipper's
+    ZoomMouseMode the near/far planes sit at dist*(1 -/+ k) about the target (half =
+    dist*k, k the mode's distance-adjusted multiplier); the fallback slab is
+    dist*0.5. Any failure (no GUI / no mouse modes) falls back to the dist*0.5 model.'''
+    try:
+        from chimerax.clipper.mousemodes import ZoomMouseMode
+        mm = [b.mode for b in session.ui.mouse_modes.bindings
+              if isinstance(b.mode, ZoomMouseMode)]
+        if mm:
+            zmm = mm[0]
+            return dist * zmm.adjusted_clip_multiplier(zmm.clip_multiplier, dist)
+    except Exception:
+        pass
+    return dist * 0.5
