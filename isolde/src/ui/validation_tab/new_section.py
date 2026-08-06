@@ -80,6 +80,9 @@ BOX_WIDTH = BOX_SIZE // 2
 GROUP_GAP = 14  # px
 # Show roughly this many rows before the vertical scrollbar kicks in.
 VISIBLE_ROWS = 8
+# Gap (px) between the fixed-width name cell and the cycle arrow, within the single
+# left-packed row that each entry is now composed into (see _compose_row).
+GAP_AFTER_NAME = 6
 
 # The lone "no imposed template" box is a flat grey (template boxes use viridis).
 NO_TEMPLATE_COLOR = 'rgb(128, 128, 128)'
@@ -590,6 +593,40 @@ class BoxRow(QWidget):
             self._commit(index)
 
 
+class _NameScroll(QScrollArea):
+    '''A fixed-width, scrollbar-less viewport for a residue-name label, so a long
+    combined-unit name ("08J 1 (Z) + CYS 145 (A)") can't stretch the name column.
+    No scrollbar is ever shown; the name can still be panned with a horizontal (or
+    shift+) wheel, while a plain vertical wheel is passed through so the residue
+    list still scrolls under the cursor. The wrapped label keeps its click-to-fly
+    and focus-underline behaviour.'''
+
+    def __init__(self, label, parent=None):
+        super().__init__(parent)
+        self.setWidget(label)
+        self.setWidgetResizable(False)  # keep the label at its full natural width
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFixedHeight(label.sizeHint().height())
+        # Transparent so it reads as a plain label, not an inset boxed widget.
+        self.setStyleSheet('QScrollArea { background: transparent; border: none; }')
+        self.viewport().setStyleSheet('background: transparent;')
+
+    def wheelEvent(self, event):
+        # Pan the name only on a horizontal (or shift-modified) wheel; let a plain
+        # vertical wheel propagate so the enclosing residue list still scrolls.
+        dx = event.angleDelta().x()
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            dx = dx or event.angleDelta().y()
+        if dx:
+            bar = self.horizontalScrollBar()
+            bar.setValue(bar.value() - dx)
+            event.accept()
+        else:
+            event.ignore()
+
+
 class ParameteriseRow(QWidget):
     '''Row for a unit that needs a *fresh* MD template built -- a covalent unit, a
     metal site, or a novel free ligand with no existing template to rebuild to. A
@@ -823,11 +860,11 @@ class NewSectionDialog(UI_Panel_Base):
                     self._add_parameterise_row(i, descriptor, label)
                 else:
                     cell, label_w = self._label_cell(label, residue)
-                    self._grid.addWidget(cell, i, 0, Qt.AlignmentFlag.AlignVCenter)
                     row = BoxRow(name_cands, comp_cands, residue=residue, dialog=self)
                     row.set_label(label_w)
-                    self._grid.addWidget(row, i, 1, Qt.AlignmentFlag.AlignVCenter)
-                    self.rows.append(row)
+                    line = self._compose_row(cell, row)
+                    self._grid.addWidget(line, i, 0, 1, 2)
+                    self.rows.append(line)
         except RuntimeError:
             # A Qt widget (e.g. the grid) was destroyed while this build was queued
             # -- the panel is gone; stop the chain rather than crash.
@@ -836,16 +873,37 @@ class NewSectionDialog(UI_Panel_Base):
         if self._pending:
             QTimer.singleShot(0, lambda: self._process_next(gen))
 
+    def _compose_row(self, cell, box_row=None):
+        '''Pack a row's column-0 label `cell` and its `box_row` (the cycle arrow +
+        suggestion boxes; None for the blank parameterise rows) into a SINGLE
+        left-hugging line, added spanning both grid columns. Doing the packing here
+        -- instead of leaning on the two-column grid, which sized each column to fit
+        and then centred the fixed-width cell / box row within it, opening gaps on
+        both sides -- keeps the pencil + name flush left and the arrow just after
+        the name. The leading pieces are fixed width, so arrows still line up across
+        rows.'''
+        line = QWidget()
+        hl = DefaultHLayout()
+        hl.setSpacing(0)
+        hl.addWidget(cell)
+        if box_row is not None:
+            hl.addSpacing(GAP_AFTER_NAME)
+            hl.addWidget(box_row)
+        hl.addStretch()
+        line.setLayout(hl)
+        return line
+
     def _add_parameterise_row(self, i, descriptor, label):
-        '''A label + a ParameteriseRow (the "build a fresh template for this whole
-        unit" action) at grid row `i`. The ChemSearch edit button targets the
-        unit's seed (the ligand for a covalent unit / free ligand; a metal-involved
-        residue for a metal site, from which ChemSearch simply derives nothing).'''
+        '''A label for a unit / novel free ligand at grid row `i`, with NO action
+        widget beside it. The "Parameterise unit/ligand" action is temporarily
+        disabled (it is broken), so rather than a dead button the row is just the
+        label. (ParameteriseRow and parameterise_unit are kept for when the action
+        is restored.) The ChemSearch edit button targets the unit's seed. Still
+        appends to self.rows so the grid row counter (len(self.rows)) stays right.'''
         cell, _label_w = self._label_cell(label, descriptor['seed'])
-        self._grid.addWidget(cell, i, 0, Qt.AlignmentFlag.AlignVCenter)
-        row = ParameteriseRow(descriptor, dialog=self)
-        self._grid.addWidget(row, i, 1, Qt.AlignmentFlag.AlignVCenter)
-        self.rows.append(row)
+        line = self._compose_row(cell)
+        self._grid.addWidget(line, i, 0, 1, 2)
+        self.rows.append(line)
 
     def _label_cell(self, label_text, residue):
         '''Column-0 cell for a row: a compact "edit in ChemSearch" button followed
@@ -858,10 +916,31 @@ class NewSectionDialog(UI_Panel_Base):
         hl.setSpacing(4)
         hl.addWidget(ChemSearchButton(self, residue, available=self._chemsearch_available()))
         label_w = ResidueNameLabel(label_text, residue)
+        label_w.setToolTip(label_text)  # full name on hover (the column is narrow)
         self._name_labels.append(label_w)  # for the camera-focus underline
-        hl.addWidget(label_w)
-        hl.addStretch()
+        # Cap the name column so a long combined-unit label ("08J 1 (Z) + CYS 145
+        # (A)") can't stretch it: the label lives in a fixed-width, scrollbar-less
+        # viewport ~30% wider than a short "ABC + DE" name. A longer name is clipped
+        # but still reachable -- hover for the full text (tooltip), or pan it with a
+        # horizontal / shift wheel (no scrollbar; a plain vertical wheel still
+        # scrolls the list -- see _NameScroll).
+        fm = label_w.fontMetrics()
+        name_w = int((fm.horizontalAdvance('ABC + DE') + 8) * 1.3)
+        sa = _NameScroll(label_w)
+        sa.setFixedWidth(name_w)
+        hl.addWidget(sa)
+        # A "..." in an always-reserved slot, shown only when the name is wider than
+        # the viewport -- flags the overflow without making the column width vary
+        # from row to row.
+        dots = QLabel('…' if fm.horizontalAdvance(label_text) > name_w else '')
+        dots.setFixedWidth(fm.horizontalAdvance('…') + 2)
+        dots.setToolTip(label_text)
+        hl.addWidget(dots)
         cell.setLayout(hl)
+        # Fixed width so column 0 stays tight and uniform: an expanding cell (the old
+        # trailing stretch) let the column soak up space and pushed the column-1
+        # arrow far to the right regardless of how narrow the name viewport was.
+        cell.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         return cell, label_w
 
     def _chemsearch_available(self):
