@@ -83,6 +83,23 @@ def choice_warning(message, allow_dont_ask_again=False, yesno=False):
         return True
     return False
 
+def confirm_action_warning(message, action_label):
+    '''
+    Warning dialog with a single custom action button (e.g. "OK [will add
+    hydrogens]"). Returns True if the user clicked it (Escape / closing the window
+    returns False). Lets a warning and its follow-up "do X?" prompt be folded into
+    one window: the button both acknowledges the warning and performs X.
+    '''
+    _dismiss_splash()
+    from Qt.QtWidgets import QMessageBox, QPushButton
+    msg = QMessageBox()
+    msg.setIcon(QMessageBox.Warning)
+    msg.setText(message)
+    action = QPushButton(action_label)
+    msg.addButton(action, QMessageBox.AcceptRole)
+    msg.exec()
+    return msg.clickedButton() == action
+
 def failed_template_warning(residue):
     '''
     Warning dialog handling the case where a template is not recognised by

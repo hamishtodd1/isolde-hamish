@@ -60,7 +60,7 @@ from Qt.QtWidgets import (
 from Qt.QtCore import Qt, QTimer
 
 from ..collapse_button import CollapsibleArea
-from ..ui_base import UI_Panel_Base, DefaultVLayout, DefaultHLayout
+from ..ui_base import UI_Panel_Base, DefaultVLayout, DefaultHLayout, busy_cursor
 
 # matplotlib is already a hard ISOLDE dependency (see the Ramachandran plot), so
 # sampling viridis for the score colour ramp adds no new requirement.
@@ -774,21 +774,26 @@ class NewSectionDialog(UI_Panel_Base):
         self._dirty = False
         self._clear_rows()
         self._build_gen += 1
+        # Persistent "Scan" button at the top (grid row 0): it re-runs detection and
+        # adds hydrogens first on click (matching needs them). It never disappears
+        # -- clicking again just rescans -- so detected rows populate BENEATH it. It
+        # is appended to self.rows, which indexes the grid rows, so those rows start
+        # on the next line rather than overwriting the button.
+        self._add_scan_row()
         # Hydrogens are a prerequisite: template matching gates on an element
         # signature that COUNTS hydrogens, so an unprotonated model reads as if
-        # every residue were unparameterised. Rather than flood the list with
-        # false positives, gate the whole section behind a single "Add hydrogens"
-        # action until the model is protonated.
+        # every residue were unparameterised. We don't auto-add them (a side
+        # effect); the user presses Scan. With no model / no hydrogens yet, the
+        # panel is just the button.
         m = self.isolde.selected_model
-        if m is not None and not self._model_has_hydrogens(m):
-            self._show_add_hydrogens_row()
+        if m is None or not self._model_has_hydrogens(m):
             self._size_scroll(1)
             return
         # Cheap bulk step: which residues are unparameterised + their raw
         # candidate sources. The expensive per-candidate FMCS is deferred to
         # _process_next so rows appear progressively rather than all at once.
         self._pending = self._detect()
-        self._size_scroll(len(self._pending))
+        self._size_scroll(len(self._pending) + 1)
         self._process_next(self._build_gen)
 
     @staticmethod
@@ -799,41 +804,42 @@ class NewSectionDialog(UI_Panel_Base):
         import numpy
         return bool((model.atoms.element_numbers == 1).any())
 
-    def _show_add_hydrogens_row(self):
-        '''Replace the residue list with a single prominent "Add hydrogens" button
-        (shown when the model has no hydrogens -- see _refresh).'''
-        btn = QPushButton('Find unparameterized residues (will add hydrogens)')
+    def _add_scan_row(self):
+        '''The persistent "Scan for unparameterized residues" button at grid row 0.
+        Clicking it adds hydrogens (matching needs them) then repopulates; it stays
+        put so a re-click simply rescans. Appended to self.rows so the detected rows
+        beneath it start on the next grid line (len(self.rows)).'''
+        btn = QPushButton('Scan for unparameterized residues  [will add hydrogens]')
         btn.setStyleSheet('QPushButton { font-weight: bold; padding: 4px 10px; }')
         btn.setToolTip(
-            'This model has no hydrogens. ISOLDE needs a fully protonated model, '
-            'and template matching counts hydrogens -- so unparameterised residues '
-            'cannot be checked until hydrogens are added.'
+            'Add hydrogens if needed (ISOLDE needs a fully protonated model, and '
+            'template matching counts hydrogens), then list the residues with no '
+            'matching MD template. Safe to click again to rescan.'
         )
-        btn.clicked.connect(lambda *_: self._add_hydrogens())
+        btn.clicked.connect(lambda *_: self._scan())
         self._grid.addWidget(btn, 0, 0, 1, 2, Qt.AlignmentFlag.AlignLeft)
+        self.rows.append(btn)
 
-    def _add_hydrogens(self):
-        '''Protonate the selected model (ISOLDE's addh convention), then refresh so
-        the section can populate. Runs only on the user's explicit click.'''
+    def _scan(self):
+        '''Scan-button action: add hydrogens (ISOLDE's addh convention), then
+        repopulate. Runs only on the user's explicit click -- the "[will add
+        hydrogens]" label flags that side effect -- and is safe to repeat. Always
+        refreshes at the end so the Scan button (and any results) are redrawn.'''
         m = self.isolde.selected_model
-        if m is None or m.deleted:
-            return
-        self.session.logger.status('Adding hydrogens...')
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            from chimerax.atomic import AtomicStructures
-            from chimerax.addh import cmd as addh_cmd
-            addh_cmd.cmd_addh(self.session, AtomicStructures([m]), hbond=True)
-        except Exception as e:
-            self.session.logger.warning(
-                'New section: could not add hydrogens ({}: {})'.format(
-                    e.__class__.__name__, e
+        if m is not None and not m.deleted:
+            try:
+                from chimerax.atomic import AtomicStructures
+                from chimerax.addh import cmd as addh_cmd
+                with busy_cursor(self.session, 'Adding hydrogens...'):
+                    addh_cmd.cmd_addh(self.session, AtomicStructures([m]), hbond=True)
+            except Exception as e:
+                self.session.logger.warning(
+                    'New section: could not add hydrogens ({}: {})'.format(
+                        e.__class__.__name__, e
+                    )
                 )
-            )
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.session.logger.status('')
-        self._refresh()
+        with busy_cursor(self.session, 'Scanning for unparameterized residues...'):
+            self._refresh()
 
     def _process_next(self, gen):
         # Build one entry's row per event-loop turn (so each paints as it lands),

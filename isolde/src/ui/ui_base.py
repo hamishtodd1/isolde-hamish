@@ -24,7 +24,35 @@ else:
 
 
 import os
+from contextlib import contextmanager
 _base_path = os.path.dirname(os.path.abspath(__file__))
+
+
+@contextmanager
+def busy_cursor(session, message=''):
+    '''Context manager for a briefly-blocking operation. Shows a wait cursor and an
+    optional status message and -- crucially -- forces them to paint
+    (``processEvents``) BEFORE the work runs, so the user gets an immediate
+    "working" signal even though the event loop is about to block. Restores the
+    cursor and clears the status on exit, including on error.
+
+    This does not stop a long synchronous call from briefly freezing the window
+    ("not responding"); it makes that freeze read as a deliberate busy state rather
+    than a hang. Only call it OUTSIDE a trigger/command stack -- the
+    ``processEvents`` here could otherwise re-enter and run deferred work
+    recursively.'''
+    from Qt.QtWidgets import QApplication
+    from Qt.QtCore import Qt
+    if message:
+        session.logger.status(message)
+    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+    QApplication.processEvents()  # paint the cursor + status before we block
+    try:
+        yield
+    finally:
+        QApplication.restoreOverrideCursor()
+        if message:
+            session.logger.status('')
 
 class HorizontalLine(QFrame):
     def __init__(self, *args, **kwargs):

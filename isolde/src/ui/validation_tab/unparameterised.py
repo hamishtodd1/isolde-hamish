@@ -1,5 +1,5 @@
 from ..collapse_button import CollapsibleArea
-from ..ui_base import UI_Panel_Base, DefaultHLayout, DefaultVLayout
+from ..ui_base import UI_Panel_Base, DefaultHLayout, DefaultVLayout, busy_cursor
 from Qt.QtWidgets import (
     QLabel, 
     QTableWidget, QTableWidgetItem, 
@@ -74,17 +74,18 @@ class UnparameterisedResiduesDialog(UI_Panel_Base):
                 return
             residues = m.residues
             self._ask_to_add_hydrogens_if_necessary(residues)
-            from chimerax.atomic import Residues
-            residues = Residues(sorted(residues, key=lambda r:(r.chain_id, r.number, r.insertion_code)))
-            if ff is None:
-                ffmgr = self.isolde.forcefield_mgr
-                ff = ffmgr[self.isolde.sim_params.forcefield]
-                ligand_db = ffmgr.ligand_db(self.isolde.sim_params.forcefield)
-            from chimerax.isolde.openmm.openmm_interface import find_residue_templates, create_openmm_topology
-            template_dict = find_residue_templates(residues, ff, ligand_db=ligand_db, logger=self.session.logger)
-            top, residue_templates=create_openmm_topology(residues.atoms, template_dict)
-            _, ambiguous, unmatched = ff.assignTemplates(top,
-                ignoreExternalBonds=True, explicit_templates=residue_templates)
+            with busy_cursor(self.session, 'Scanning for unparameterised residues...'):
+                from chimerax.atomic import Residues
+                residues = Residues(sorted(residues, key=lambda r:(r.chain_id, r.number, r.insertion_code)))
+                if ff is None:
+                    ffmgr = self.isolde.forcefield_mgr
+                    ff = ffmgr[self.isolde.sim_params.forcefield]
+                    ligand_db = ffmgr.ligand_db(self.isolde.sim_params.forcefield)
+                from chimerax.isolde.openmm.openmm_interface import find_residue_templates, create_openmm_topology
+                template_dict = find_residue_templates(residues, ff, ligand_db=ligand_db, logger=self.session.logger)
+                top, residue_templates=create_openmm_topology(residues.atoms, template_dict)
+                _, ambiguous, unmatched = ff.assignTemplates(top,
+                    ignoreExternalBonds=True, explicit_templates=residue_templates)
         row_count = len(unmatched)+len(ambiguous)
         if row_count == 0:
             table.setRowCount(1)
@@ -228,12 +229,28 @@ class UnparameterisedResiduesDialog(UI_Panel_Base):
         self.fix_button.setEnabled(False)
         
     def _unparam_res_cb(self, *_):
-        from chimerax.isolde.dialog import generic_warning
+        # This trigger is activated from INSIDE the failed "sim start" command (see
+        # isolde.py's RuntimeError handler). Showing a modal dialog and -- above all
+        # -- running addh from within that command/trigger stack can crash ChimeraX:
+        # the partially-built, now-aborting simulation still holds references to the
+        # atoms addh would add to / delete. Defer to the next event-loop turn, by
+        # which point the command has fully unwound and the model is safe to mutate.
+        QTimer.singleShot(0, self._show_unparam_warning_and_fix)
+
+    def _show_unparam_warning_and_fix(self):
+        from chimerax.isolde.dialog import confirm_action_warning
         warn_str = ('At least one residue in your model does not match any templates '
             'in the MD forcefield. This may be due to missing or superfluous atoms, '
             'or an unusual residue that has not yet been parameterised. Launching '
             'the unparameterised residue widget to help sort this out.')
-        generic_warning(warn_str)
+        # One window instead of two: this button both acknowledges the warning and
+        # adds hydrogens (missing/misplaced H being the most common cause). Adding
+        # them here means the populate-time _ask_to_add_hydrogens_if_necessary finds
+        # them present and stays silent -- so there is no separate second prompt.
+        m = self.isolde.selected_model
+        if confirm_action_warning(warn_str, 'OK  [will add hydrogens]') \
+                and m is not None and not m.deleted:
+            self._run_add_hydrogens(m.residues)
         mtw = self.gui.main_tab_widget
         mtw.setCurrentWidget(self.gui.validate_tab)
         self.container.expand()
@@ -255,19 +272,29 @@ class UnparameterisedResiduesDialog(UI_Panel_Base):
             elif self.waters_without_h(residues):
                 addh = choice_warning('Some or all waters are missing hydrogens. Would you like to add them first?')
             if addh:
-                from chimerax.core.commands import run
-                run(self.session, f'addh #{residues.unique_structures[0].id_string}')
-                # Occasionally addh will add only one hydrogen to a water (typically when too close to a metal). Catch 
-                # and fix to avoid user confusion.
-                waters = residues[residues.names=='HOH']
-                bad = [w for w in waters if len(w.atoms) < 3]
-                from chimerax.build_structure import modify_atom
-                for b in bad:
-                    o = b.find_atom('O')
-                    if o is None:
-                        self.session.logger.warning(f'Water /{b.chain_id}:{b.number} is missing its O atom. Deleting.')
-                        b.delete()
-                    modify_atom(o, o.element, 2)
+                self._run_add_hydrogens(residues)
+
+    def _run_add_hydrogens(self, residues):
+        '''Add hydrogens to the residues' structure via ChimeraX addh, then repair
+        any water that addh left with a single hydrogen (which happens near metals).
+        No dialog -- the caller has already confirmed the action.'''
+        if not len(residues):
+            return
+        from chimerax.core.commands import run
+        from chimerax.build_structure import modify_atom
+        with busy_cursor(self.session, 'Adding hydrogens...'):
+            run(self.session, f'addh #{residues.unique_structures[0].id_string}')
+            # Occasionally addh adds only one hydrogen to a water (typically when it
+            # is too close to a metal). Catch and fix to avoid user confusion.
+            waters = residues[residues.names == 'HOH']
+            bad = [w for w in waters if len(w.atoms) < 3]
+            for b in bad:
+                o = b.find_atom('O')
+                if o is None:
+                    self.session.logger.warning(f'Water /{b.chain_id}:{b.number} is missing its O atom. Deleting.')
+                    b.delete()
+                    continue
+                modify_atom(o, o.element, 2)
 
             
     def suspiciously_low_h(self, residues):
