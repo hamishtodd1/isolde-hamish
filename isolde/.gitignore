@@ -73,3 +73,10 @@ coverage.xml
 
 # Sphinx documentation
 docs/_build/
+
+# ISOLDE parameterisation output: running a "Parameterise" action writes a
+# generated OpenMM force-field XML (<ligand>.xml, <ligand>_metal.xml, ...) into
+# the working directory. These are regenerable run artifacts, never committed.
+# Anchored + non-recursive, so it only catches these top-level drops and never the
+# tracked force fields under src/openmm/amberff/.
+/*.xml
