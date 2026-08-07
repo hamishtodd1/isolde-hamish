@@ -139,6 +139,20 @@ FMCS_TIMEOUT_S = 2
 # colour at build time -- see NewSectionDialog._model_carbon_color.)
 PREVIEW_STICK_RADIUS = 0.05
 
+# --- "flatten to 2D" morph (pencil button) --------------------------------
+# Clicking the pencil animates a residue's heavy atoms from their real 3D
+# positions into a 2D chemical-diagram layout (computed by ChemSearch) laid on a
+# plane facing the camera -- one view, no popup, and the atoms visibly resolve
+# into the diagram so a newcomer keeps track of which atom is which. Driven by a
+# QTimer; MORPH_STEP is the fraction of the transition added per tick, so the
+# whole morph takes ~1/MORPH_STEP ticks * MORPH_TICK_MS end to end.
+MORPH_TICK_MS = 16
+MORPH_STEP = 1.0 / 24  # ~0.4 s at 16 ms/tick
+# Scale applied to the (Angstrom-ish) 2D layout when embedding it in the scene.
+# RDKit's ~1.5 A bond length already approx= scene scale, so 1.0 keeps the diagram
+# the residue's size; a little larger spreads it out for legibility.
+DEPICTION_SCALE = 1.4
+
 
 def _ease_in_out_sine(t):
     '''Ease-in-out on a fraction t in [0, 1]: zero derivative (hence zero
@@ -419,14 +433,24 @@ class ChemSearchButton(QToolButton):
         self.setAutoRaise(True)  # flat until hovered, matching the arrow button
         self.setFixedSize(BOX_SIZE, BOX_SIZE)
         if available:
-            self.setToolTip('Open this residue in the ChemSearch 2D editor')
+            self.setToolTip(
+                'Flatten this residue to a 2D diagram in place '
+                '(click again to restore; Shift-click to open the '
+                'full ChemSearch editor)'
+            )
             self.clicked.connect(self._clicked)
         else:
             self.setEnabled(False)
             self.setToolTip('ChimeraX-ChemSearch is not installed')
 
     def _clicked(self, *_):
-        self._dialog.open_in_chemsearch(self.residue)
+        # Left-click flattens the residue to a 2D diagram in the 3D view (the
+        # default -- one view, no popup); Shift-click still opens the full
+        # ChemSearch 2D editor for actual editing.
+        from Qt.QtWidgets import QApplication
+        from Qt.QtCore import Qt
+        shift = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+        self._dialog._pencil_clicked(self.residue, open_editor=shift)
 
 
 class ResidueNameLabel(QLabel):
@@ -713,6 +737,12 @@ class NewSectionDialog(UI_Panel_Base):
         self._deleted = False
         self._preview_row = None
         self._preview_structure = None
+        # Active "flatten to 2D" morph (pencil button), or None: a dict of the
+        # throwaway depiction structure, its atom collection + per-atom
+        # start/target coords, colour table, missing-atom mask, animation clock and
+        # QTimer. Mutually exclusive with a template preview (each stops the other);
+        # torn down by every panel exit path via _stop_morph.
+        self._morph = None
         # While a preview is shown we hide the residue it stands in for, remembering
         # it + its atoms' display state so leaving restores exactly that. (The
         # preview's link to its chain neighbours is drawn as stub atoms/bonds inside
@@ -760,6 +790,7 @@ class NewSectionDialog(UI_Panel_Base):
         # Stop the self-rescheduling _process_next build chain before our Qt
         # widgets are destroyed, then let the base class drop trigger handlers.
         self._deleted = True
+        self._stop_morph()
         if self._frame_handler is not None:
             self.session.triggers.remove_handler(self._frame_handler)
             self._frame_handler = None
@@ -993,6 +1024,9 @@ class NewSectionDialog(UI_Panel_Base):
 
     # --- preview management (one superimposed preview at a time) ----------
     def show_preview(self, row, template_name):
+        # A template preview and a flatten-to-2D morph are mutually exclusive: a
+        # hover preview taking over cancels any flattened depiction.
+        self._stop_morph()
         # A different row taking over clears the previous row's grey outline.
         if self._preview_row is not None and self._preview_row is not row:
             self._preview_row.clear_preview_outline()
@@ -1028,6 +1062,7 @@ class NewSectionDialog(UI_Panel_Base):
         # Ignore stale calls from a row that no longer owns the preview.
         if row is not None and self._preview_row is not None and self._preview_row is not row:
             return
+        self._stop_morph()  # a full clear also cancels any flatten-to-2D morph
         self._delete_preview_structure()
         self._preview_row = None
 
@@ -1222,8 +1257,10 @@ class NewSectionDialog(UI_Panel_Base):
                 progress, still = False, []
                 for i in pending:
                     anchor = next(
-                        (index_by_atom[nb] for nb in s.atoms[i].neighbors
-                         if index_by_atom[nb] in placed), None
+                        (
+                            index_by_atom[nb]
+                            for nb in s.atoms[i].neighbors if index_by_atom[nb] in placed
+                        ), None
                     )
                     if anchor is None:
                         still.append(i)
@@ -1436,6 +1473,251 @@ class NewSectionDialog(UI_Panel_Base):
                     residue.name, e.__class__.__name__, e
                 )
             )
+
+    # --- "flatten to 2D" morph (pencil button, default action) -----------
+    def _pencil_clicked(self, residue, open_editor=False):
+        '''Pencil-button action. Default (open_editor False): toggle a
+        flatten-to-2D morph -- animate the residue's heavy atoms from their real
+        3D positions into a 2D chemical-diagram layout, in the 3D view, so no
+        second window is needed. Clicking the pencil of the residue already
+        flattened restores it. Shift-click (open_editor True) opens the full
+        ChemSearch 2D editor for actual editing.'''
+        if residue is None or residue.deleted:
+            return
+        if open_editor:
+            self.open_in_chemsearch(residue)
+            return
+        mo = self._morph
+        if mo is not None and mo.get('residue') is residue:
+            self._stop_morph()  # toggle the flattened depiction back off
+            return
+        self._start_morph(residue)
+
+    def _2d_layout_data(self, residue):
+        '''ChemSearch's 2D depiction of `residue` as plain data (see
+        chemsearch.layout_2d_for_residue), or None. Never opens the ChemSearch
+        tool/web view; a missing bundle or any failure is a quiet None.'''
+        try:
+            from chimerax.chemsearch import layout_2d_for_residue
+        except Exception:
+            return None
+        try:
+            return layout_2d_for_residue(self.session, residue)
+        except Exception as e:
+            self.session.logger.info(
+                'New section: 2D layout for {} failed ({}: {})'.format(
+                    residue.name, e.__class__.__name__, e
+                )
+            )
+            return None
+
+    def _start_morph(self, residue):
+        '''Begin the flatten-to-2D morph for `residue`. Falls back to opening the
+        full ChemSearch editor when no 2D depiction can be derived (e.g. a
+        coordinated metal whose bond orders can't be perceived), so the pencil
+        always does something useful.'''
+        if residue is None or residue.deleted:
+            return
+        data = self._2d_layout_data(residue)
+        if not data or not data.get('atoms'):
+            self.open_in_chemsearch(residue)
+            return
+        # Cancel any preview/morph and restore displays BEFORE we read the
+        # residue's real coordinates and hide it.
+        self.remove_preview()
+        try:
+            mo = self._build_2d_depiction_structure(residue, data)
+        except Exception as e:
+            self.session.logger.info(
+                'New section: 2D morph build for {} failed ({}: {})'.format(
+                    residue.name, e.__class__.__name__, e
+                )
+            )
+            mo = None
+        if mo is None:
+            self.open_in_chemsearch(residue)
+            return
+        # Hide the real residue so the flat depiction stands in for it, and select
+        # it (matching the hover-preview idiom).
+        self._hide_replaced(residue)
+        _select_residue(residue)
+        # Arm CofR-based dismissal exactly as show_preview does, so navigating away
+        # drops the depiction (it faces the camera at creation, so an orbit would
+        # otherwise leave it oblique). Seeded settled if we are already centred.
+        self._preview_center = _framing_point(residue)
+        self._preview_settled = False
+        try:
+            import numpy
+            c = self.session.main_view.center_of_rotation
+            self._preview_settled = (
+                self._preview_center is not None and c is not None
+                and numpy.linalg.norm(numpy.asarray(c, dtype=float) - self._preview_center)
+                < COFR_MATCH_DISTANCE
+            )
+        except Exception:
+            pass
+        from Qt.QtCore import QTimer
+        timer = QTimer()
+        timer.timeout.connect(self._morph_tick)
+        mo['timer'] = timer
+        self._morph = mo
+        timer.start(MORPH_TICK_MS)
+
+    def _stop_morph(self):
+        '''Tear down any active flatten-to-2D morph: stop its timer, delete the
+        throwaway depiction structure, and restore the hidden residue. Idempotent;
+        called by every panel exit path (remove_preview / show_preview / cleanup).'''
+        mo = self._morph
+        if mo is None:
+            return
+        self._morph = None
+        t = mo.get('timer')
+        if t is not None:
+            try:
+                t.stop()
+            except Exception:
+                pass
+        s = mo.get('structure')
+        if s is not None and not s.deleted:
+            try:
+                s.delete()
+            except Exception:
+                pass
+        # Undo _hide_replaced and clear the CofR-drop arming (shared with preview).
+        self._restore_replaced()
+        self._preview_center = None
+        self._preview_settled = False
+
+    def _build_2d_depiction_structure(self, residue, data):
+        '''Build the throwaway child structure + animation arrays for the morph,
+        returning a morph-state dict or None. Coordinates are in the
+        residue.structure LOCAL frame (as _build_preview), and the target 2D plane
+        faces the current camera. Modelled atoms start at their real 3D position;
+        unmodelled ("missing") atoms start at their 2D position with zero alpha and
+        fade in as the morph completes.'''
+        import numpy
+        from chimerax.atomic import AtomicStructure, Atom, Atoms, Element
+        from chimerax.atomic.colors import element_colors
+        atoms = data.get('atoms') or []
+        if not atoms:
+            return None
+        m = residue.structure
+        # Resolve each modelled atom to its live 3D coordinate (local frame). A
+        # named twin gone under a live edit is treated as unmodelled.
+        twin = []
+        for a in atoms:
+            c = None
+            nm = a.get('name')
+            if a.get('modelled') and nm:
+                ma = residue.find_atom(nm)
+                if ma is not None and not ma.deleted:
+                    c = numpy.asarray(ma.coord, dtype=float)
+            twin.append(c)
+        present = [c for c in twin if c is not None]
+        if not present:
+            return None
+        centroid = numpy.mean(numpy.stack(present), axis=0)
+        # 2D plane basis = camera right/up, expressed in the model's local frame.
+        cam = self.session.main_view.camera
+        cmat = numpy.asarray(cam.position.matrix, dtype=float)[:, :3]
+        right, up = cmat[:, 0], cmat[:, 1]
+        try:
+            R = numpy.asarray(m.scene_position.inverse().matrix, dtype=float)[:, :3]
+            right, up = R.dot(right), R.dot(up)
+        except Exception:
+            pass
+        right = right / (numpy.linalg.norm(right) or 1.0)
+        up = up / (numpy.linalg.norm(up) or 1.0)
+        xy = numpy.array([(a['x'], a['y']) for a in atoms], dtype=float)
+        lc = xy.mean(axis=0)
+        target = (
+            centroid[None, :] + DEPICTION_SCALE * (
+                (xy[:, 0] - lc[0])[:, None] * right[None, :] +
+                (xy[:, 1] - lc[1])[:, None] * up[None, :]
+            )
+        )
+        start = numpy.array(
+            [twin[i] if twin[i] is not None else target[i] for i in range(len(atoms))],
+            dtype=float
+        )
+        missing = numpy.array([twin[i] is None for i in range(len(atoms))], dtype=bool)
+        # Throwaway depiction structure (heavy atoms only), initially overlaying the
+        # real atoms; missing atoms start invisible. Keep an atom collection in the
+        # SAME order as `atoms`/`start`/... so per-frame coord/colour assignment
+        # lines up (do not rely on Structure.atoms ordering).
+        s = AtomicStructure(self.session, name='2D depiction', auto_style=False)
+        dres = s.new_residue(residue.name, 'A', 1)
+        sa = []
+        for i, a in enumerate(atoms):
+            na = s.new_atom('{}{}'.format(a['element'], i), Element.get_element(a['element']))
+            na.coord = start[i]
+            dres.add_atom(na)
+            sa.append(na)
+        for b in data.get('bonds') or []:
+            i, j = b.get('i'), b.get('j')
+            if i is not None and j is not None and i != j \
+                    and 0 <= i < len(sa) and 0 <= j < len(sa):
+                try:
+                    s.new_bond(sa[i], sa[j])
+                except Exception:
+                    pass
+        s.pickable = False
+        coll = Atoms(sa)
+        coll.draw_modes = Atom.STICK_STYLE
+        coll.radii = PREVIEW_STICK_RADIUS
+        base_colors = element_colors(coll.element_numbers)
+        carbons = coll.element_numbers == 6
+        if carbons.any():
+            base_colors[carbons] = self._model_carbon_color(residue)
+        base_colors[:, 3] = 255
+        init = base_colors.copy()
+        init[missing, 3] = 0
+        coll.colors = init
+        s.bonds.radii = PREVIEW_STICK_RADIUS
+        s.bonds.halfbonds = True
+        m.add([s])
+        return {
+            'structure': s,
+            'residue': residue,
+            'coll': coll,
+            'start': start,
+            'target': target,
+            'base_colors': base_colors,
+            'missing': missing,
+            't': 0.0,
+        }
+
+    def _morph_tick(self):
+        '''One animation step: ease the depiction from 3D (t=0) to 2D (t=1) and
+        fade the missing atoms in. Stops the timer at t=1 (the flat depiction then
+        persists until dismissed). Bails safely if the structure or residue was
+        deleted under us (live editing).'''
+        mo = self._morph
+        if mo is None:
+            return
+        s = mo.get('structure')
+        residue = mo.get('residue')
+        if s is None or s.deleted or residue is None or residue.deleted:
+            self._stop_morph()
+            return
+        mo['t'] = min(1.0, mo['t'] + MORPH_STEP)
+        e = _ease_in_out_sine(mo['t'])
+        try:
+            coll = mo['coll']
+            coll.coords = mo['start'] + e * (mo['target'] - mo['start'])
+            colors = mo['base_colors'].copy()
+            colors[mo['missing'], 3] = int(round(e * 255))
+            coll.colors = colors
+        except Exception:
+            self._stop_morph()
+            return
+        if mo['t'] >= 1.0:
+            t = mo.get('timer')
+            if t is not None:
+                try:
+                    t.stop()
+                except Exception:
+                    pass
 
     # --- data (FMCS-scored candidate templates) --------------------------
     def _detect(self):
