@@ -152,6 +152,12 @@ MORPH_STEP = 1.0 / 24  # ~0.4 s at 16 ms/tick
 # RDKit's ~1.5 A bond length already approx= scene scale, so 1.0 keeps the diagram
 # the residue's size; a little larger spreads it out for legibility.
 DEPICTION_SCALE = 1.4
+# Tier B: double/triple/aromatic bonds get inner parallel line(s), drawn as thin
+# helper bonds offset DEPICTION_BOND_GAP (scene units) perpendicular to the bond
+# within the diagram plane and shortened by DEPICTION_BOND_INSET (fraction each
+# end), RDKit-style. Added only once the morph is flat (planar geometry).
+DEPICTION_BOND_GAP = 0.22
+DEPICTION_BOND_INSET = 0.2
 
 
 def _ease_in_out_sine(t):
@@ -1628,6 +1634,9 @@ class NewSectionDialog(UI_Panel_Base):
             pass
         right = right / (numpy.linalg.norm(right) or 1.0)
         up = up / (numpy.linalg.norm(up) or 1.0)
+        # Diagram-plane normal, for offsetting multiplicity inner-lines in-plane.
+        normal = numpy.cross(right, up)
+        normal = normal / (numpy.linalg.norm(normal) or 1.0)
         xy = numpy.array([(a['x'], a['y']) for a in atoms], dtype=float)
         lc = xy.mean(axis=0)
         target = (
@@ -1653,22 +1662,30 @@ class NewSectionDialog(UI_Panel_Base):
             na.coord = start[i]
             dres.add_atom(na)
             sa.append(na)
+        # Single stick per bond (multiplicity is drawn later as inner parallel
+        # lines); collect the double/triple/aromatic bonds to decorate at t=1.
+        deco_bonds = []
         for b in data.get('bonds') or []:
             i, j = b.get('i'), b.get('j')
-            if i is not None and j is not None and i != j \
-                    and 0 <= i < len(sa) and 0 <= j < len(sa):
-                try:
-                    s.new_bond(sa[i], sa[j])
-                except Exception:
-                    pass
+            if i is None or j is None or i == j \
+                    or not (0 <= i < len(sa) and 0 <= j < len(sa)):
+                continue
+            try:
+                s.new_bond(sa[i], sa[j])
+            except Exception:
+                continue
+            order = b.get('order') or 1.0
+            if b.get('aromatic') or round(order) >= 2:
+                deco_bonds.append((i, j, float(order), bool(b.get('aromatic'))))
         s.pickable = False
         coll = Atoms(sa)
         coll.draw_modes = Atom.STICK_STYLE
         coll.radii = PREVIEW_STICK_RADIUS
+        carbon_color = self._model_carbon_color(residue)
         base_colors = element_colors(coll.element_numbers)
         carbons = coll.element_numbers == 6
         if carbons.any():
-            base_colors[carbons] = self._model_carbon_color(residue)
+            base_colors[carbons] = carbon_color
         base_colors[:, 3] = 255
         init = base_colors.copy()
         init[missing, 3] = 0
@@ -1684,6 +1701,10 @@ class NewSectionDialog(UI_Panel_Base):
             'target': target,
             'base_colors': base_colors,
             'missing': missing,
+            'normal': normal,
+            'deco_bonds': deco_bonds,
+            'line_color': carbon_color,
+            'decorated': False,
             't': 0.0,
         }
 
@@ -1712,10 +1733,77 @@ class NewSectionDialog(UI_Panel_Base):
             self._stop_morph()
             return
         if mo['t'] >= 1.0:
+            if not mo.get('decorated'):
+                mo['decorated'] = True
+                try:
+                    self._add_diagram_decorations(mo)
+                except Exception as e:
+                    self.session.logger.info(
+                        'New section: 2D diagram decorations failed ({}: {})'.format(
+                            e.__class__.__name__, e
+                        )
+                    )
             t = mo.get('timer')
             if t is not None:
                 try:
                     t.stop()
+                except Exception:
+                    pass
+
+    def _add_diagram_decorations(self, mo):
+        '''Tier B: draw double/triple/aromatic bonds as inner parallel line(s) so
+        the flattened depiction reads as a chemical diagram. Runs once the morph is
+        flat (geometry is planar only at t=1). Each inner line is a thin helper
+        bond offset perpendicular to the bond within the diagram plane and
+        shortened at each end (RDKit-style): one inner line for a double/aromatic
+        bond, two (either side of the existing stick) for a triple. The helpers
+        live in the depiction structure, so its deletion tidies them up.'''
+        import numpy
+        from chimerax.atomic import Atom, Element
+        s = mo.get('structure')
+        if s is None or s.deleted:
+            return
+        deco = mo.get('deco_bonds') or []
+        if not deco:
+            return
+        target = mo['target']
+        normal = numpy.asarray(mo['normal'], dtype=float)
+        color = mo['line_color']
+        dres = s.residues[0]
+        r = PREVIEW_STICK_RADIUS
+        for (i, j, order, aromatic) in deco:
+            pi = numpy.asarray(target[i], dtype=float)
+            pj = numpy.asarray(target[j], dtype=float)
+            d = pj - pi
+            length = float(numpy.linalg.norm(d))
+            if length < 1e-6:
+                continue
+            d = d / length
+            off = numpy.cross(d, normal)
+            no = float(numpy.linalg.norm(off))
+            if no < 1e-6:
+                continue
+            off = off / no * DEPICTION_BOND_GAP
+            a = pi + d * (length * DEPICTION_BOND_INSET)
+            b = pj - d * (length * DEPICTION_BOND_INSET)
+            # triple -> a line either side of the central stick; else one inner line.
+            signs = (-1.0, 1.0) if round(order) >= 3 else (1.0,)
+            for sgn in signs:
+                h1 = s.new_atom('d', Element.get_element('C'))
+                h1.coord = a + off * sgn
+                dres.add_atom(h1)
+                h2 = s.new_atom('d', Element.get_element('C'))
+                h2.coord = b + off * sgn
+                dres.add_atom(h2)
+                for h in (h1, h2):
+                    h.draw_mode = Atom.STICK_STYLE
+                    h.radius = r
+                    h.color = color
+                try:
+                    bd = s.new_bond(h1, h2)
+                    bd.radius = r
+                    bd.halfbond = False
+                    bd.color = color
                 except Exception:
                     pass
 
