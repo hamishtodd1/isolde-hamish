@@ -362,6 +362,12 @@ class SelectableBox(QFrame):
         self._committed = False
         self._previewed = False
         self._hovered = False
+        # Debounce for the dwell-delayed preview scheduling (enter + mouse-move).
+        self._reveal_pending = False
+        # Track motion with no button so a preview dropped (CofR drifted off) while
+        # the cursor is still inside can be re-armed on movement -- see
+        # mouseMoveEvent (otherwise only a fresh enterEvent would bring it back).
+        self.setMouseTracking(True)
         self._apply_style()
         self.setToolTip(tooltip)
 
@@ -402,8 +408,20 @@ class SelectableBox(QFrame):
         # then preview/fly after a short dwell; see _maybe_preview.
         self._hovered = True
         if QApplication.mouseButtons() == Qt.MouseButton.NoButton:
-            QTimer.singleShot(HOVER_PREVIEW_DELAY_MS, self._maybe_preview)
+            self._schedule_preview()
         super().enterEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # If the preview was dropped (the centre of rotation drifted off the
+        # residue) while the cursor is still inside this box, no enterEvent fires to
+        # bring it back and dwelling does nothing. Re-arm on movement -- but only
+        # when this box is NOT already the active preview, so sweeping across boxes
+        # or an already-shown preview does not re-fly on every pixel of movement.
+        if not self._previewed \
+                and QApplication.mouseButtons() == Qt.MouseButton.NoButton:
+            self._hovered = True
+            self._schedule_preview()
+        super().mouseMoveEvent(event)
 
     def leaveEvent(self, event):
         # Only drop the dwell flag here; the transient preview is cleared at the
@@ -412,10 +430,22 @@ class SelectableBox(QFrame):
         self._hovered = False
         super().leaveEvent(event)
 
+    def _schedule_preview(self):
+        # Dwell-delayed preview, debounced so enter + a burst of mouse-moves queue
+        # just one check (a fast sweep across the box then leaves -> _maybe_preview
+        # sees _hovered False and no-ops, so no preview/fly on pass-through).
+        if self._reveal_pending:
+            return
+        self._reveal_pending = True
+        QTimer.singleShot(HOVER_PREVIEW_DELAY_MS, self._maybe_preview)
+
     def _maybe_preview(self):
-        # Deferred hover: fly/preview only if still hovered with no button held.
-        # The hovered flag (set in enterEvent) is more reliable than underMouse()
-        # on the first entry. Guarded in case the box/row was deleted meanwhile.
+        # Deferred hover: fly/preview only if still hovered, not already previewing
+        # this box, and no button held. The hovered flag (set in enter/move) is more
+        # reliable than underMouse(). Guarded in case the box/row was deleted.
+        self._reveal_pending = False
+        if self._previewed:
+            return
         if not self._hovered or QApplication.mouseButtons() != Qt.MouseButton.NoButton:
             return
         try:
