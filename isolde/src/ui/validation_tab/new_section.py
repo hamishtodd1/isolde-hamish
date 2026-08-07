@@ -876,6 +876,7 @@ class NewSectionDialog(UI_Panel_Base):
         # of both the populate delay and the "Error fetching CCD ..." log spam).
         self._tmpl_mol_cache = {}  # ccd_name -> RDKit mol or None
         self._preview_buildable = {}  # ccd_name -> bool (False = don't retry)
+        self._leaving_cache = {}  # ccd_name -> frozenset of leaving-atom names
         # Recompute on the unparameterised-residue trigger (correct whether the
         # section is open or closed), but do the expensive FMCS/build only when
         # visible: a trigger while collapsed just marks the panel dirty.
@@ -1259,17 +1260,23 @@ class NewSectionDialog(UI_Panel_Base):
     def _leaving_atom_names(self, ccd_name):
         '''CCD atom names flagged ``pdbx_leaving_atom_flag == 'Y'`` for `ccd_name`
         (empty set if unavailable). Read from ChemComp's full record, which keeps
-        the flag that ccd_records/lookup drop (they return 4-tuples).'''
+        the flag that ccd_records/lookup drop (they return 4-tuples). Memoised
+        (a network fetch fallback) -- now consulted per candidate for dedup.'''
+        cache = self._leaving_cache
+        if ccd_name in cache:
+            return cache[ccd_name]
+        result = set()
         try:
             from chimerax.chemcomp import record
             rec = record(self.session, ccd_name)
+            if isinstance(rec, dict):
+                atoms = rec.get('atoms')
+                if atoms:
+                    result = {a[0] for a in atoms if len(a) > 5 and a[5] == 'Y'}
         except Exception:
-            return set()
-        if isinstance(rec, dict):
-            atoms = rec.get('atoms')
-            if atoms:
-                return {a[0] for a in atoms if len(a) > 5 and a[5] == 'Y'}
-        return set()
+            result = set()
+        cache[ccd_name] = result
+        return result
 
     @staticmethod
     def _model_carbon_color(residue):
@@ -2206,7 +2213,11 @@ class NewSectionDialog(UI_Panel_Base):
 
     def _candidates_for(self, kind, payload, residue):
         '''(name_cands, comp_cands) for one residue -- the expensive per-candidate
-        FMCS step, run lazily from _process_next so rows appear progressively.'''
+        FMCS step, run lazily from _process_next so rows appear progressively.
+        Candidates whose chain linkage can't match the residue's actual position are
+        dropped (_filter_by_linkage), then functional duplicates -- templates
+        differing only in the start/end atoms discarded on linking -- are collapsed
+        (_dedup_functional_duplicates).'''
         res_mol = self._residue_mol(residue)
         if kind == 'unmatched':
             try:
@@ -2214,12 +2225,17 @@ class NewSectionDialog(UI_Panel_Base):
                 by_name, by_comp = ff.find_possible_templates(payload)
             except Exception:
                 by_name, by_comp = [], []
-            return (
-                self._candidates([tn for tn, _ in by_name], 'Name Match', res_mol),
-                self._candidates([tn for tn, _ in by_comp], 'Topology Match', res_mol),
+            name_cands = self._candidates([tn for tn, _ in by_name], 'Name Match', res_mol)
+            comp_cands = self._candidates([tn for tn, _ in by_comp], 'Topology Match', res_mol)
+        else:
+            name_cands = []
+            comp_cands = self._candidates(
+                [ti[0].name for ti in payload], 'Topology Match', res_mol
             )
-        names = [ti[0].name for ti in payload]
-        return ([], self._candidates(names, 'Topology Match', res_mol))
+        name_cands, comp_cands = self._filter_by_linkage(
+            name_cands, comp_cands, self._residue_link_count(residue)
+        )
+        return self._dedup_functional_duplicates(name_cands, comp_cands)
 
     def _candidates(self, template_names, kind, res_mol):
         '''Candidate descriptors for a group, ordered by descending FMCS overlap
@@ -2240,7 +2256,123 @@ class NewSectionDialog(UI_Panel_Base):
             'fraction': frac,
             'fill': _fraction_to_viridis_css(frac),
             'tooltip': _match_tooltip(kind, tname, frac, ccd_name, description),
+            'signature': self._template_signature(tname),
         }
+
+    def _template_signature(self, tname):
+        '''A key identifying template `tname` up to its polymer start/end atoms: the
+        CCD base id plus the sorted names of its atoms that are NOT CCD leaving
+        atoms (heavy AND hydrogen). Two templates with the same signature differ
+        only in the atoms discarded when the residue is linked into a chain -- e.g.
+        a free/terminal form vs the main-chain-linked form -- so they are
+        functionally the same once linked. Keeping hydrogens in the signature means
+        genuine chemical variants (CYS/CYX/CYM, other protonation states) are NOT
+        collapsed: their side-chain H differs, and that is not a leaving atom.
+        Returns None when it can't be computed -- an unsignable candidate is never
+        deduped (safer to show a redundant box than hide a needed one).'''
+        try:
+            ff = self.isolde.forcefield_mgr[self.isolde.sim_params.forcefield]
+            tmpl = ff._templates.get(tname)
+            if tmpl is None:
+                return None
+            ccd_name = self._public_ccd_id(tname)
+            leaving = self._leaving_atom_names(ccd_name) if ccd_name else set()
+            names = tuple(sorted(a.name for a in tmpl.atoms if a.name not in leaving))
+            if not names:
+                return None
+            return (ccd_name,) + names
+        except Exception:
+            return None
+
+    def _dedup_functional_duplicates(self, name_cands, comp_cands):
+        '''Collapse candidate templates that are functionally identical once the
+        residue is linked into a chain -- those sharing a _template_signature
+        (differing only in the start/end atoms discarded on linking). Within each
+        such group the survivor is the highest-FMCS-overlap candidate, which is the
+        variant "designed" for the residue's ACTUAL terminal state: a main-chain
+        residue matches the linked form best (a free form's extra terminal atoms
+        lower its overlap), while a real chain terminus matches the free/terminal
+        form best. Candidates whose signature is None are always kept. Order within
+        each group is preserved.'''
+        best = {}
+        for c in list(name_cands) + list(comp_cands):
+            sig = c.get('signature')
+            if sig is None:
+                continue
+            f = c['fraction'] if c['fraction'] is not None else -1.0
+            if sig not in best or f > best[sig]:
+                best[sig] = f
+        kept = set()
+
+        def survives(c):
+            sig = c.get('signature')
+            if sig is None:
+                return True
+            if sig in kept:
+                return False
+            f = c['fraction'] if c['fraction'] is not None else -1.0
+            if f < best[sig]:
+                return False
+            kept.add(sig)
+            return True
+
+        return (
+            [c for c in name_cands if survives(c)],
+            [c for c in comp_cands if survives(c)],
+        )
+
+    @staticmethod
+    def _residue_link_count(residue):
+        '''Number of the residue's inter-residue (covalent) bonds -- its chain
+        linkages: 2 for a mid-chain residue (N to the previous residue, C to the
+        next), 1 for a chain terminus, 0 for a free monomer (a disulfide /
+        glycosidic / covalent-mod bond adds one). None on failure.'''
+        if residue is None or residue.deleted:
+            return None
+        try:
+            return sum(
+                1 for a in residue.atoms for nb in a.neighbors if nb.residue is not residue
+            )
+        except Exception:
+            return None
+
+    def _template_external_count(self, tname):
+        '''Number of external (inter-residue) bonds template `tname` declares -- 2
+        for a main-chain-linked amino acid (N and C), fewer for a terminal/free
+        form. None if it can't be determined.'''
+        try:
+            ff = self.isolde.forcefield_mgr[self.isolde.sim_params.forcefield]
+            tmpl = ff._templates.get(tname)
+            if tmpl is None:
+                return None
+            ext = getattr(tmpl, 'externalBonds', None)
+            if ext is not None:
+                return len(ext)
+            return sum(int(getattr(a, 'externalBonds', 0) or 0) for a in tmpl.atoms)
+        except Exception:
+            return None
+
+    def _filter_by_linkage(self, name_cands, comp_cands, res_link_count):
+        '''Drop candidates whose declared external-bond count does not match the
+        residue's actual chain-linkage count -- e.g. an end-of-chain template (one
+        linkage) suggested for a residue in the MIDDLE of a chain (two), which is
+        what let a terminal-only template (like 5CR) leak in. A template of unknown
+        external-bond count is kept (never wrongly hidden), and if the filter would
+        remove EVERYTHING the unfiltered lists are returned instead -- so an unusual
+        residue whose true template under-declares its linkages degrades to the old
+        behaviour (a few extra boxes) rather than an empty row.'''
+        if res_link_count is None:
+            return name_cands, comp_cands
+
+        def compatible(c):
+            n = self._template_external_count(c['template_name'])
+            return n is None or n == res_link_count
+
+        fname = [c for c in name_cands if compatible(c)]
+        fcomp = [c for c in comp_cands if compatible(c)]
+        if not fname and not fcomp:
+            return name_cands, comp_cands
+        return fname, fcomp
 
     def _residue_mol(self, residue):
         '''Context-aware heavy-atom RDKit Mol for `residue`, built once per
