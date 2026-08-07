@@ -141,23 +141,25 @@ PREVIEW_STICK_RADIUS = 0.05
 
 # --- "flatten to 2D" morph (pencil button) --------------------------------
 # Clicking the pencil animates a residue's heavy atoms from their real 3D
-# positions into a 2D chemical-diagram layout (computed by ChemSearch) laid on a
-# plane facing the camera -- one view, no popup, and the atoms visibly resolve
-# into the diagram so a newcomer keeps track of which atom is which. Driven by a
-# QTimer; MORPH_STEP is the fraction of the transition added per tick, so the
-# whole morph takes ~1/MORPH_STEP ticks * MORPH_TICK_MS end to end.
+# positions into a 2D chemical-diagram layout (computed by ChemSearch), embedded
+# in the residue's OWN best-fit plane, while the camera reorients to face that
+# plane (see _build_2d_depiction_structure / _begin_focus) -- one view, no popup,
+# and a planar core (e.g. an aromatic ring) reads as rotating rigidly rather than
+# each atom sliding independently. Driven by a QTimer; MORPH_STEP is the fraction
+# of the transition added per tick, so the morph takes ~1/MORPH_STEP ticks.
 MORPH_TICK_MS = 16
 MORPH_STEP = 1.0 / 24  # ~0.4 s at 16 ms/tick
-# Scale applied to the (Angstrom-ish) 2D layout when embedding it in the scene.
-# RDKit's ~1.5 A bond length already approx= scene scale, so 1.0 keeps the diagram
-# the residue's size; a little larger spreads it out for legibility.
-DEPICTION_SCALE = 1.4
 # Tier B: double/triple/aromatic bonds get inner parallel line(s), drawn as thin
 # helper bonds offset DEPICTION_BOND_GAP (scene units) perpendicular to the bond
 # within the diagram plane and shortened by DEPICTION_BOND_INSET (fraction each
 # end), RDKit-style. Added only once the morph is flat (planar geometry).
 DEPICTION_BOND_GAP = 0.22
 DEPICTION_BOND_INSET = 0.2
+# Tier C "focus mode": while a residue is flattened, everything except the 2D
+# depiction fades right out -- context atoms/bonds/ribbons ramp to this alpha
+# (0 = fully invisible); density maps hard-hide. The camera reorientation (orbit
+# to face the diagram's plane) lives in _begin_focus / _apply_focus.
+DEPICTION_FADE_ALPHA = 0
 
 
 def _ease_in_out_sine(t):
@@ -240,6 +242,66 @@ def _fly_to_residue(residue):
         easing=_ease_in_out_sine,
         frames=TRANSITION_FRAMES,
         max_interpolate_distance=snap
+    )
+
+
+def _best_fit_plane(coords):
+    '''PCA best-fit plane of Nx3 `coords`. Returns (centroid, u, v, n): an
+    orthonormal frame with u, v spanning the plane (the two largest-variance
+    principal axes) and n the normal (smallest-variance axis). None if there are
+    < 3 points or the fit is degenerate (near-collinear -> normal ill-defined).'''
+    import numpy
+    c = numpy.asarray(coords, dtype=float)
+    if len(c) < 3:
+        return None
+    centroid = c.mean(axis=0)
+    q = c - centroid
+    # eigh gives ascending eigenvalues; eigenvectors are the principal axes.
+    w, V = numpy.linalg.eigh(q.T @ q)
+    if w[1] < 1e-6:  # middle eigenvalue ~0 => atoms ~collinear
+        return None
+    n = V[:, 0]  # smallest variance -> plane normal
+    v = V[:, 1]
+    u = V[:, 2]  # largest variance -> primary in-plane axis
+    return centroid, u, v, n
+
+
+def _procrustes_2d(q, p):
+    '''Best 2D similarity (uniform scale sc, orthogonal R -- REFLECTION ALLOWED,
+    since a 2D depiction need not preserve 3D chirality and allowing it minimises
+    motion -- and translation tau) mapping `q` -> `p` (both Nx2): p ~= sc*(q @ R.T)
+    + tau. Returns (sc, R, tau); identity-ish on a degenerate `q`.'''
+    import numpy
+    q = numpy.asarray(q, dtype=float)
+    p = numpy.asarray(p, dtype=float)
+    qm, pm = q.mean(axis=0), p.mean(axis=0)
+    qc, pc = q - qm, p - pm
+    var_q = float((qc**2).sum())
+    if var_q < 1e-9:
+        return 1.0, numpy.eye(2), pm - qm
+    U, S, Vt = numpy.linalg.svd(pc.T @ qc)
+    R = U @ Vt  # reflection allowed (no det fix)
+    sc = float(S.sum()) / var_q
+    return sc, R, pm - sc * (qm @ R.T)
+
+
+def _rodrigues(axis, angle):
+    '''3x3 rotation matrix for `angle` radians about `axis` (Rodrigues formula);
+    identity for a ~zero axis or angle.'''
+    import numpy
+    a = numpy.asarray(axis, dtype=float)
+    na = float(numpy.linalg.norm(a))
+    if na < 1e-9 or abs(angle) < 1e-9:
+        return numpy.eye(3)
+    x, y, z = a / na
+    c, s = numpy.cos(angle), numpy.sin(angle)
+    C = 1.0 - c
+    return numpy.array(
+        [
+            [c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+            [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+            [z * x * C - y * s, z * y * C + x * s, c + z * z * C],
+        ]
     )
 
 
@@ -1364,6 +1426,27 @@ class NewSectionDialog(UI_Panel_Base):
                         hs[0].coord = n - bis / bl * 1.01
             except Exception:
                 pass
+            # Draw double/triple/aromatic bonds as inner parallel lines so the
+            # preview reads as a chemical diagram even in the ordinary 3D view (bond
+            # orders from the template's RDKit mol, matched to the preview atoms by
+            # name; the offset uses each bond's local sp2 plane). Best-effort.
+            try:
+                orders = self._rdkit_bond_orders(self._template_mol(ccd_name))
+                if orders:
+                    specs = []
+                    for bond in s.bonds:
+                        b1, b2 = bond.atoms
+                        if not (b1.display and b2.display):
+                            continue
+                        oa = orders.get(frozenset((b1.name, b2.name)))
+                        if oa is not None:
+                            specs.append((b1, b2, oa[0], oa[1]))
+                    if specs:
+                        self._add_multiplicity_lines(
+                            s, specs, self._model_carbon_color(residue)
+                        )
+            except Exception:
+                pass
             residue.structure.add([s])
             self._preview_buildable[ccd_name] = True
             return s
@@ -1547,6 +1630,7 @@ class NewSectionDialog(UI_Panel_Base):
         # it (matching the hover-preview idiom).
         self._hide_replaced(residue)
         _select_residue(residue)
+        self._begin_focus(mo, residue)
         # Arm CofR-based dismissal exactly as show_preview does, so navigating away
         # drops the depiction (it faces the camera at creation, so an orbit would
         # otherwise leave it oblique). Seeded settled if we are already centred.
@@ -1591,6 +1675,7 @@ class NewSectionDialog(UI_Panel_Base):
                 pass
         # Undo _hide_replaced and clear the CofR-drop arming (shared with preview).
         self._restore_replaced()
+        self._end_focus(mo)
         self._preview_center = None
         self._preview_settled = False
 
@@ -1619,32 +1704,41 @@ class NewSectionDialog(UI_Panel_Base):
                 if ma is not None and not ma.deleted:
                     c = numpy.asarray(ma.coord, dtype=float)
             twin.append(c)
-        present = [c for c in twin if c is not None]
-        if not present:
+        present_idx = [i for i in range(len(atoms)) if twin[i] is not None]
+        if not present_idx:
             return None
-        centroid = numpy.mean(numpy.stack(present), axis=0)
-        # 2D plane basis = camera right/up, expressed in the model's local frame.
-        cam = self.session.main_view.camera
-        cmat = numpy.asarray(cam.position.matrix, dtype=float)[:, :3]
-        right, up = cmat[:, 0], cmat[:, 1]
-        try:
-            R = numpy.asarray(m.scene_position.inverse().matrix, dtype=float)[:, :3]
-            right, up = R.dot(right), R.dot(up)
-        except Exception:
-            pass
-        right = right / (numpy.linalg.norm(right) or 1.0)
-        up = up / (numpy.linalg.norm(up) or 1.0)
-        # Diagram-plane normal, for offsetting multiplicity inner-lines in-plane.
-        normal = numpy.cross(right, up)
-        normal = normal / (numpy.linalg.norm(normal) or 1.0)
-        xy = numpy.array([(a['x'], a['y']) for a in atoms], dtype=float)
-        lc = xy.mean(axis=0)
-        target = (
-            centroid[None, :] + DEPICTION_SCALE * (
-                (xy[:, 0] - lc[0])[:, None] * right[None, :] +
-                (xy[:, 1] - lc[1])[:, None] * up[None, :]
-            )
-        )
+        present = numpy.stack([twin[i] for i in present_idx])
+        xy = numpy.array([(a['x'], a['y']) for a in atoms], dtype=float)  # RDKit 2D
+        # Embed the 2D layout in the residue's OWN best-fit plane, so a planar core
+        # barely moves during the morph while the camera (see _begin_focus)
+        # reorients to face it. Fall back to a camera-facing plane if a plane can't
+        # be fit (too few / ~collinear modelled atoms).
+        plane = _best_fit_plane(present)
+        if plane is not None:
+            centroid, u, v, normal = plane
+        else:
+            cam = self.session.main_view.camera
+            cmat = numpy.asarray(cam.position.matrix, dtype=float)[:, :3]
+            u, v = cmat[:, 0], cmat[:, 1]
+            try:
+                Rinv = numpy.asarray(m.scene_position.inverse().matrix, dtype=float)[:, :3]
+                u, v = Rinv.dot(u), Rinv.dot(v)
+            except Exception:
+                pass
+            u = u / (numpy.linalg.norm(u) or 1.0)
+            v = v / (numpy.linalg.norm(v) or 1.0)
+            normal = numpy.cross(u, v)
+            normal = normal / (numpy.linalg.norm(normal) or 1.0)
+            centroid = present.mean(axis=0)
+        # Align RDKit's abstract layout to the in-plane projection of the modelled
+        # atoms (2D similarity, reflection allowed) so their 2D targets sit as close
+        # as possible to where they already are -- minimal, mostly-rigid motion for
+        # a planar core; the out-of-plane component becomes the visible "flatten".
+        rel = present - centroid
+        proj = numpy.column_stack((rel.dot(u), rel.dot(v)))
+        sc, R2, tau = _procrustes_2d(xy[present_idx], proj)
+        a_all = sc * (xy @ R2.T) + tau
+        target = (centroid[None, :] + a_all[:, 0:1] * u[None, :] + a_all[:, 1:2] * v[None, :])
         start = numpy.array(
             [twin[i] if twin[i] is not None else target[i] for i in range(len(atoms))],
             dtype=float
@@ -1702,6 +1796,7 @@ class NewSectionDialog(UI_Panel_Base):
             'base_colors': base_colors,
             'missing': missing,
             'normal': normal,
+            'plane_centroid': centroid,
             'deco_bonds': deco_bonds,
             'line_color': carbon_color,
             'decorated': False,
@@ -1732,6 +1827,7 @@ class NewSectionDialog(UI_Panel_Base):
         except Exception:
             self._stop_morph()
             return
+        self._apply_focus(mo, e)
         if mo['t'] >= 1.0:
             if not mo.get('decorated'):
                 mo['decorated'] = True
@@ -1751,59 +1847,254 @@ class NewSectionDialog(UI_Panel_Base):
                     pass
 
     def _add_diagram_decorations(self, mo):
-        '''Tier B: draw double/triple/aromatic bonds as inner parallel line(s) so
-        the flattened depiction reads as a chemical diagram. Runs once the morph is
-        flat (geometry is planar only at t=1). Each inner line is a thin helper
-        bond offset perpendicular to the bond within the diagram plane and
-        shortened at each end (RDKit-style): one inner line for a double/aromatic
-        bond, two (either side of the existing stick) for a triple. The helpers
-        live in the depiction structure, so its deletion tidies them up.'''
+        '''Tier B: draw the flattened depiction's double/triple/aromatic bonds as
+        inner parallel line(s), once the morph is flat. Delegates to the shared
+        _add_multiplicity_lines (also used by the 3D hover preview).'''
+        s = mo.get('structure')
+        coll = mo.get('coll')
+        deco = mo.get('deco_bonds') or []
+        if s is None or s.deleted or coll is None or not deco:
+            return
+        specs = []
+        for (i, j, order, aromatic) in deco:
+            try:
+                specs.append((coll[i], coll[j], order, aromatic))
+            except Exception:
+                pass
+        self._add_multiplicity_lines(s, specs, mo['line_color'])
+
+    def _add_multiplicity_lines(self, structure, specs, color):
+        '''Add inner parallel line(s) for the multiple bonds in `specs` -- a list of
+        (atomA, atomB, order, aromatic) within `structure` -- so double / triple /
+        aromatic bonds read as a chemical diagram. Drawn as thin helper bonds
+        offset perpendicular to each bond, within the plane of a bonded neighbour
+        (the local sp2 plane), so it works both in 3D (the hover preview) and in 2D
+        (the flattened depiction): one inner line for a double/aromatic bond, one
+        either side of the central stick for a triple. Shortened at each end
+        (RDKit-style). Helpers live in `structure`, so its deletion tidies them up.'''
         import numpy
         from chimerax.atomic import Atom, Element
-        s = mo.get('structure')
-        if s is None or s.deleted:
-            return
-        deco = mo.get('deco_bonds') or []
-        if not deco:
-            return
-        target = mo['target']
-        normal = numpy.asarray(mo['normal'], dtype=float)
-        color = mo['line_color']
-        dres = s.residues[0]
         r = PREVIEW_STICK_RADIUS
-        for (i, j, order, aromatic) in deco:
-            pi = numpy.asarray(target[i], dtype=float)
-            pj = numpy.asarray(target[j], dtype=float)
-            d = pj - pi
-            length = float(numpy.linalg.norm(d))
+        for (a, b, order, aromatic) in specs:
+            if a is None or b is None or a.deleted or b.deleted:
+                continue
+            pa = numpy.asarray(a.coord, dtype=float)
+            pb = numpy.asarray(b.coord, dtype=float)
+            axis = pb - pa
+            length = float(numpy.linalg.norm(axis))
             if length < 1e-6:
                 continue
-            d = d / length
-            off = numpy.cross(d, normal)
-            no = float(numpy.linalg.norm(off))
-            if no < 1e-6:
-                continue
-            off = off / no * DEPICTION_BOND_GAP
-            a = pi + d * (length * DEPICTION_BOND_INSET)
-            b = pj - d * (length * DEPICTION_BOND_INSET)
-            # triple -> a line either side of the central stick; else one inner line.
+            axis = axis / length
+            # Offset perpendicular to the bond, toward a heavy neighbour (the local
+            # sp2 plane); fall back to any perpendicular for an isolated bond.
+            off = None
+            for end in (a, b):
+                for nb in end.neighbors:
+                    if nb is a or nb is b:
+                        continue
+                    w = numpy.asarray(nb.coord, dtype=float) - pa
+                    perp = w - numpy.dot(w, axis) * axis
+                    npn = float(numpy.linalg.norm(perp))
+                    if npn > 1e-3:
+                        off = perp / npn
+                        break
+                if off is not None:
+                    break
+            if off is None:
+                seed = numpy.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9 \
+                    else numpy.array([0.0, 1.0, 0.0])
+                off = numpy.cross(axis, seed)
+                off = off / (numpy.linalg.norm(off) or 1.0)
+            off = off * DEPICTION_BOND_GAP
+            pa2 = pa + axis * (length * DEPICTION_BOND_INSET)
+            pb2 = pb - axis * (length * DEPICTION_BOND_INSET)
+            dres = a.residue
             signs = (-1.0, 1.0) if round(order) >= 3 else (1.0,)
             for sgn in signs:
-                h1 = s.new_atom('d', Element.get_element('C'))
-                h1.coord = a + off * sgn
+                h1 = structure.new_atom('d', Element.get_element('C'))
+                h1.coord = pa2 + off * sgn
                 dres.add_atom(h1)
-                h2 = s.new_atom('d', Element.get_element('C'))
-                h2.coord = b + off * sgn
+                h2 = structure.new_atom('d', Element.get_element('C'))
+                h2.coord = pb2 + off * sgn
                 dres.add_atom(h2)
                 for h in (h1, h2):
                     h.draw_mode = Atom.STICK_STYLE
                     h.radius = r
                     h.color = color
                 try:
-                    bd = s.new_bond(h1, h2)
+                    bd = structure.new_bond(h1, h2)
                     bd.radius = r
                     bd.halfbond = False
                     bd.color = color
+                except Exception:
+                    pass
+
+    def _rdkit_bond_orders(self, mol):
+        '''{frozenset(name1, name2): (order:int, aromatic:bool)} for the multiple
+        (order >= 2 or aromatic) bonds of an RDKit `mol` whose atoms carry the
+        ChimeraX/CCD name prop (e.g. from _template_mol). Empty on any failure or a
+        nameless mol -- lets a caller decorate a structure's bonds by atom name.'''
+        out = {}
+        if mol is None:
+            return out
+        try:
+            from chimerax.isolde.atomic.rdkit_bridge import NAME_PROP
+        except Exception:
+            return out
+        try:
+            for b in mol.GetBonds():
+                a1, a2 = b.GetBeginAtom(), b.GetEndAtom()
+                if not (a1.HasProp(NAME_PROP) and a2.HasProp(NAME_PROP)):
+                    continue
+                aromatic = bool(b.GetIsAromatic())
+                order = int(round(b.GetBondTypeAsDouble()))
+                if aromatic or order >= 2:
+                    out[frozenset((a1.GetProp(NAME_PROP), a2.GetProp(NAME_PROP)))
+                        ] = (order, aromatic)
+        except Exception:
+            return {}
+        return out
+
+    # --- Tier C "focus mode": dim the scene + centre/zoom the camera -----
+    def _begin_focus(self, mo, residue):
+        '''Set up focus mode for an active morph: snapshot and fade out the rest of
+        the scene (other atomic models' atoms/bonds/ribbons ramp to 0 alpha;
+        density maps hard-hide) and compute the camera ORBIT that turns the view to
+        face the diagram's plane (so a planar core reads as rotating rigidly into a
+        face-on view). Stores what it changes in `mo` for _end_focus to restore.
+        Best-effort: any part that fails is skipped; the camera is None if it can't
+        be computed.'''
+        import numpy
+        from chimerax.atomic import AtomicStructure
+        try:
+            from chimerax.map import Volume
+        except Exception:
+            Volume = ()
+        s = mo['structure']
+        fade_structs, hidden_maps = [], []
+        for m in self.session.models.list():
+            if m is s or getattr(m, 'deleted', False):
+                continue
+            if isinstance(m, AtomicStructure):
+                try:
+                    fade_structs.append(
+                        (
+                            m, m.atoms.colors.copy(),
+                            m.bonds.colors.copy() if m.num_bonds else None,
+                            m.residues.ribbon_colors.copy()
+                        )
+                    )
+                except Exception:
+                    pass
+            elif Volume and isinstance(m, Volume) and m.display:
+                m.display = False
+                hidden_maps.append(m)
+        mo['fade_structs'] = fade_structs
+        mo['hidden_maps'] = hidden_maps
+        # Camera: orbit so the view direction ends along the diagram-plane normal
+        # (face-on), keeping the diagram centred. Orientation change + recentre
+        # only, no zoom -- the layout is already the residue's real size, and the
+        # rigid core barely moves in world, so it reads as rotating rigidly into
+        # view while the floppy parts flatten.
+        mo['cam'] = None
+        try:
+            cam = self.session.main_view.camera
+            W = residue.structure.scene_position
+            centroid_w = numpy.asarray(
+                W.transform_points(numpy.asarray(mo['plane_centroid'],
+                                                 dtype=float)[None, :])[0],
+                dtype=float
+            )
+            n_w = numpy.asarray(
+                W.transform_vector(numpy.asarray(mo['normal'], dtype=float)), dtype=float
+            )
+            n_w = n_w / (numpy.linalg.norm(n_w) or 1.0)
+            view_dir = numpy.asarray(cam.view_direction(), dtype=float)
+            O0 = numpy.asarray(cam.position.origin(), dtype=float)
+            rot0 = numpy.asarray(cam.position.matrix, dtype=float)[:, :3].copy()
+            # Face the plane from the current side (so the orbit is <= 90 degrees).
+            nf = n_w if float(numpy.dot(view_dir, n_w)) >= 0 else -n_w
+            dvec = centroid_w - O0
+            d = float(numpy.dot(dvec, view_dir))
+            if d <= 0:
+                d = float(numpy.linalg.norm(dvec)) or 1.0
+            axis = numpy.cross(view_dir, nf)
+            sn = float(numpy.linalg.norm(axis))
+            angle = float(numpy.arctan2(sn, float(numpy.dot(view_dir, nf))))
+            axis = axis / sn if sn > 1e-9 else numpy.array([1.0, 0.0, 0.0])
+            mo['cam'] = {
+                'axis': axis,
+                'angle': angle,
+                'rot0': rot0,
+                'O0': O0,
+                'O1': centroid_w - nf * d,
+            }
+        except Exception:
+            mo['cam'] = None
+
+    def _apply_focus(self, mo, e):
+        '''Per-tick focus update at eased fraction `e`: fade the context (fresh
+        collections each tick, alpha channel only -- never a held stale collection)
+        and orbit the camera toward the face-on view. Best-effort.'''
+        import numpy
+        alpha = int(round(255 + e * (DEPICTION_FADE_ALPHA - 255)))
+        for entry in mo.get('fade_structs') or []:
+            m = entry[0]
+            if m is None or m.deleted:
+                continue
+            try:
+                a = m.atoms
+                c = a.colors
+                c[:, 3] = alpha
+                a.colors = c
+                if m.num_bonds:
+                    bc = m.bonds.colors
+                    bc[:, 3] = alpha
+                    m.bonds.colors = bc
+                rc = m.residues.ribbon_colors
+                rc[:, 3] = alpha
+                m.residues.ribbon_colors = rc
+            except Exception:
+                pass
+        c = mo.get('cam')
+        if c is not None:
+            try:
+                from chimerax.geometry import Place
+                cam = self.session.main_view.camera
+                rot = _rodrigues(c['axis'], e * c['angle']) @ c['rot0']
+                origin = c['O0'] + e * (c['O1'] - c['O0'])
+                mat = numpy.empty((3, 4), dtype=float)
+                mat[:, :3] = rot
+                mat[:, 3] = origin
+                cam.position = Place(mat)
+            except Exception:
+                pass
+
+    def _end_focus(self, mo):
+        '''Undo _begin_focus: restore the dimmed models' colours (length-guarded,
+        like _restore_replaced) and re-show the hidden maps. The camera is
+        deliberately left where it landed (flying it back would be surprising).'''
+        for entry in mo.get('fade_structs') or []:
+            m, ac, bc, rc = entry
+            if m is None or m.deleted:
+                continue
+            try:
+                if len(m.atoms) == len(ac):
+                    m.atoms.colors = ac
+                else:
+                    c = m.atoms.colors
+                    c[:, 3] = 255
+                    m.atoms.colors = c
+                if bc is not None and m.num_bonds == len(bc):
+                    m.bonds.colors = bc
+                if len(m.residues) == len(rc):
+                    m.residues.ribbon_colors = rc
+            except Exception:
+                pass
+        for m in mo.get('hidden_maps') or []:
+            if m is not None and not m.deleted:
+                try:
+                    m.display = True
                 except Exception:
                     pass
 
@@ -2017,6 +2308,10 @@ class NewSectionDialog(UI_Panel_Base):
         return mol
 
     def selected_model_changed_cb(self, *_):
-        # Switching models drops any preview and clears the list; it repopulates
-        # on the next detection or when the section is (re)expanded.
+        # Switching models tears down any preview/morph and rebuilds the panel for
+        # the new model. _clear_rows drops the stale rows (and their old-model
+        # residue refs); _refresh then re-adds the persistent Scan button -- it must
+        # NOT vanish on a model switch (the earlier _clear_rows-only path was the
+        # bug) -- and, when expanded, repopulates for the new model.
         self._clear_rows()
+        self._refresh()
