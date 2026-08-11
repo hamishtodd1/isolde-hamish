@@ -44,7 +44,7 @@ FMCS is computed lazily (only while the section is expanded) to keep the
 background populate cheap on large models.
 '''
 
-from math import cos, pi
+from math import cos, pi, sin
 
 from Qt.QtWidgets import (
     QWidget,
@@ -83,6 +83,11 @@ VISIBLE_ROWS = 8
 # Gap (px) between the fixed-width name cell and the cycle arrow, within the single
 # left-packed row that each entry is now composed into (see _compose_row).
 GAP_AFTER_NAME = 6
+# Width of the residue-name viewport, as a multiple of a short "ABC + DE" label's
+# advance (+8px). Bumped to ~2x so multi-residue unit names -- e.g.
+# "FES 3908 (A) + CYS 62 (A) + CYS 47 (A) + ..." -- are far more legible before
+# clipping; longer names still clip + pan/tooltip (see _NameScroll).
+NAME_WIDTH_FACTOR = 2.6
 
 # The lone "no imposed template" box is a flat grey (template boxes use viridis).
 NO_TEMPLATE_COLOR = 'rgb(128, 128, 128)'
@@ -146,6 +151,20 @@ PREVIEW_STICK_RADIUS = 0.05
 # (see NewSectionDialog._add_multiplicity_lines).
 DEPICTION_BOND_GAP = 0.22
 DEPICTION_BOND_INSET = 0.2
+
+# Aromatic 5-/6-membered rings are depicted the textbook way -- a dotted circle
+# inscribed in the ring plane -- rather than an inner line on every ring bond
+# (which reads as "all doubles"). The circle is placed a fixed clearance
+# AROMATIC_CIRCLE_GAP (Angstroms) inside the ring bonds: its radius is the ring's
+# apothem (centroid-to-bond-midpoint distance) minus that gap. Anchoring to the
+# apothem rather than the circumradius makes the bond-to-circle spacing EQUAL for
+# hexagons and pentagons (a pentagon's smaller apothem gives a smaller circle)
+# instead of scaling with ring size. Drawn as a ring of small non-bonded spheres
+# ("dots") spaced ~AROMATIC_CIRCLE_DOT_SPACING apart, each of radius
+# AROMATIC_CIRCLE_DOT_RADIUS (see NewSectionDialog._add_aromatic_ring_circle).
+AROMATIC_CIRCLE_GAP = 0.3
+AROMATIC_CIRCLE_DOT_SPACING = 0.2
+AROMATIC_CIRCLE_DOT_RADIUS = 0.07
 
 
 def _ease_in_out_sine(t):
@@ -406,7 +425,7 @@ class AcceptButton(QPushButton):
         super().__init__('✓', parent)  # check mark
         self.row = row
         self.setFixedSize(BOX_SIZE, BOX_SIZE)
-        self.setToolTip('Accept this template')
+        self.setToolTip(_tooltip_html('Accept this template'))
         self.setStyleSheet(
             'QPushButton { background-color: #2e7d32; color: white; '
             'font-weight: bold; border: 1px solid #1b5e20; border-radius: 3px; }'
@@ -430,22 +449,32 @@ class ChemSearchButton(QToolButton):
     not installed the button is disabled with an explanatory tooltip rather than
     hidden (more discoverable than a silently absent control).'''
 
-    def __init__(self, dialog, residue, available=True, parent=None):
+    def __init__(self, dialog, residue, available=True, unit_residues=None, parent=None):
         super().__init__(parent)
         self._dialog = dialog
         self.residue = residue  # held across time -- check .deleted before use
+        # For a covalent unit, the whole unit's residues -- seeded into ChemSearch as
+        # ONE combined molecule (the covalent adduct). None or a single residue ->
+        # just `residue` is seeded. Held across time; .deleted checked at use.
+        self.unit_residues = unit_residues
         self.setText('✎')  # pencil: "draw / edit this structure"
         self.setAutoRaise(True)  # flat until hovered, matching the arrow button
         self.setFixedSize(BOX_SIZE, BOX_SIZE)
         if available:
-            self.setToolTip('Open this residue in the ChemSearch 2D editor')
+            multi = unit_residues is not None and len(unit_residues) > 1
+            self.setToolTip(
+                _tooltip_html(
+                    'Open this covalent unit in the ChemSearch 2D editor'
+                    if multi else 'Open this residue in the ChemSearch 2D editor'
+                )
+            )
             self.clicked.connect(self._clicked)
         else:
             self.setEnabled(False)
-            self.setToolTip('ChimeraX-ChemSearch is not installed')
+            self.setToolTip(_tooltip_html('ChimeraX-ChemSearch is not installed'))
 
     def _clicked(self, *_):
-        self._dialog.open_in_chemsearch(self.residue)
+        self._dialog.open_in_chemsearch(self.residue, self.unit_residues)
 
 
 class ResidueNameLabel(QLabel):
@@ -674,7 +703,7 @@ class ParameteriseRow(QWidget):
             )
         if note is not None:
             btn.setEnabled(False)
-            btn.setToolTip(note)
+            btn.setToolTip(_tooltip_html(note))
         else:
             btn.clicked.connect(self._clicked)
         hl.addWidget(btn)
@@ -833,9 +862,11 @@ class NewSectionDialog(UI_Panel_Base):
         btn = QPushButton('Scan for unparameterized residues  [will add hydrogens]')
         btn.setStyleSheet('QPushButton { font-weight: bold; padding: 4px 10px; }')
         btn.setToolTip(
-            'Add hydrogens if needed (ISOLDE needs a fully protonated model, and '
-            'template matching counts hydrogens), then list the residues with no '
-            'matching MD template. Safe to click again to rescan.'
+            _tooltip_html(
+                'Add hydrogens if needed (ISOLDE needs a fully protonated model, and '
+                'template matching counts hydrogens), then list the residues with no '
+                'matching MD template. Safe to click again to rescan.'
+            )
         )
         btn.clicked.connect(lambda *_: self._scan())
         self._grid.addWidget(btn, 0, 0, 1, 2, Qt.AlignmentFlag.AlignLeft)
@@ -921,38 +952,61 @@ class NewSectionDialog(UI_Panel_Base):
         return line
 
     def _add_parameterise_row(self, i, descriptor, label):
-        '''A label for a unit / novel free ligand at grid row `i`, with NO action
-        widget beside it. The "Parameterise unit/ligand" action is temporarily
-        disabled (it is broken), so rather than a dead button the row is just the
-        label. (ParameteriseRow and parameterise_unit are kept for when the action
-        is restored.) The ChemSearch edit button targets the unit's seed. Still
-        appends to self.rows so the grid row counter (len(self.rows)) stays right.'''
-        cell, _label_w = self._label_cell(label, descriptor['seed'])
-        line = self._compose_row(cell)
+        '''A unit / novel free ligand row at grid row `i`: the residue label
+        followed by a "Parameterise unit/ligand" button (ParameteriseRow) that runs
+        the AM1-BCC pipeline for the whole unit on click (parameterise_unit). The
+        button disables itself with an explanatory note when the unit cannot be
+        built here -- an unsupported metal (no bundled LJ params, e.g. Mo), an
+        unresolved metal site, or too large for AM1-BCC. The ChemSearch edit button
+        targets the unit's seed. Appends to self.rows so the grid row counter
+        (len(self.rows)) stays right.'''
+        # Only a COVALENT unit seeds the whole unit into ChemSearch (a ligand + the
+        # residue it is bonded to is one real molecule). Metal sites and free
+        # ligands seed just their seed residue -- a multi-residue metal cluster has
+        # no sane single 2D structure (RDKit can't perceive it, no CCD match).
+        unit_residues = (
+            descriptor['residues'] if descriptor.get('kind') == 'covalent' else None
+        )
+        cell, _label_w = self._label_cell(
+            label, descriptor['seed'], unit_residues=unit_residues
+        )
+        prow = ParameteriseRow(descriptor, dialog=self)
+        line = self._compose_row(cell, prow)
         self._grid.addWidget(line, i, 0, 1, 2)
         self.rows.append(line)
 
-    def _label_cell(self, label_text, residue):
+    def _label_cell(self, label_text, residue, unit_residues=None):
         '''Column-0 cell for a row: a compact "edit in ChemSearch" button followed
         by the residue label. Returns (cell_widget, label_widget) -- the label is
         returned separately because a BoxRow watches its leave events (set_label).
         `residue` is the row's representative residue (a free ligand, or a unit's
-        seed) handed to the ChemSearch editor.'''
+        seed) handed to the ChemSearch editor. `unit_residues`, when given for a
+        COVALENT unit, makes the pencil seed the whole unit as one combined molecule
+        instead of just `residue`.'''
         cell = QWidget()
         hl = DefaultHLayout()
         hl.setSpacing(4)
-        hl.addWidget(ChemSearchButton(self, residue, available=self._chemsearch_available()))
+        hl.addWidget(
+            ChemSearchButton(
+                self,
+                residue,
+                available=self._chemsearch_available(),
+                unit_residues=unit_residues
+            )
+        )
         label_w = ResidueNameLabel(label_text, residue)
-        label_w.setToolTip(label_text)  # full name on hover (the column is narrow)
+        # Route through _tooltip_html (dark bg + light text): a bare-string tooltip
+        # renders unreadable (solid black) under ChimeraX's dark QToolTip palette.
+        label_w.setToolTip(_tooltip_html(label_text))  # full name (the column is narrow)
         self._name_labels.append(label_w)  # for the camera-focus underline
         # Cap the name column so a long combined-unit label ("08J 1 (Z) + CYS 145
         # (A)") can't stretch it: the label lives in a fixed-width, scrollbar-less
-        # viewport ~30% wider than a short "ABC + DE" name. A longer name is clipped
-        # but still reachable -- hover for the full text (tooltip), or pan it with a
-        # horizontal / shift wheel (no scrollbar; a plain vertical wheel still
+        # viewport NAME_WIDTH_FACTOR x a short "ABC + DE" name. A longer name is
+        # clipped but still reachable -- hover for the full text (tooltip), or pan it
+        # with a horizontal / shift wheel (no scrollbar; a plain vertical wheel still
         # scrolls the list -- see _NameScroll).
         fm = label_w.fontMetrics()
-        name_w = int((fm.horizontalAdvance('ABC + DE') + 8) * 1.3)
+        name_w = int((fm.horizontalAdvance('ABC + DE') + 8) * NAME_WIDTH_FACTOR)
         sa = _NameScroll(label_w)
         sa.setFixedWidth(name_w)
         hl.addWidget(sa)
@@ -961,7 +1015,7 @@ class NewSectionDialog(UI_Panel_Base):
         # from row to row.
         dots = QLabel('…' if fm.horizontalAdvance(label_text) > name_w else '')
         dots.setFixedWidth(fm.horizontalAdvance('…') + 2)
-        dots.setToolTip(label_text)
+        dots.setToolTip(_tooltip_html(label_text))
         hl.addWidget(dots)
         cell.setLayout(hl)
         # Fixed width so column 0 stays tight and uniform: an expanding cell (the old
@@ -1350,25 +1404,44 @@ class NewSectionDialog(UI_Panel_Base):
                         hs[0].coord = n - bis / bl * 1.01
             except Exception:
                 pass
-            # Draw double/triple/aromatic bonds as inner parallel lines so the
-            # preview reads as a chemical diagram even in the ordinary 3D view (bond
-            # orders from the template's RDKit mol, matched to the preview atoms by
-            # name; the offset uses each bond's local sp2 plane). Best-effort.
+            # Turn the preview into a chemical diagram even in the ordinary 3D
+            # view: aromatic rings get a dotted inscribed circle (textbook
+            # notation), and the remaining double/triple bonds get inner parallel
+            # line(s). Both come from the template's RDKit mol, matched to the
+            # preview atoms by name. An aromatic-ring bond is depicted by its
+            # circle, so it is excluded from the inner-line pass -- unless its ring
+            # is only partly present (leaving atoms hidden), in which case no circle
+            # was drawn and the bond falls back to a single inner line. Best-effort.
             try:
-                orders = self._rdkit_bond_orders(self._template_mol(ccd_name))
+                mol = self._template_mol(ccd_name)
+                color = self._model_carbon_color(residue)
+                prev_by_name = {a.name: a for a in s.atoms}
+                # (a) Aromatic rings -> dotted circles. Record the bonds of every
+                # ring we actually drew, so the inner-line pass skips them.
+                circled_bonds = set()
+                for ring in self._rdkit_aromatic_rings(mol):
+                    ring_atoms = [prev_by_name.get(n) for n in ring]
+                    if any(a is None or not a.display for a in ring_atoms):
+                        continue  # ring not fully present -> no sensible circle
+                    if self._add_aromatic_ring_circle(s, ring_atoms, color):
+                        n = len(ring)
+                        for i in range(n):
+                            circled_bonds.add(frozenset((ring[i], ring[(i + 1) % n])))
+                # (b) Remaining multiple bonds -> inner parallel line(s).
+                orders = self._rdkit_bond_orders(mol)
                 if orders:
                     specs = []
                     for bond in s.bonds:
                         b1, b2 = bond.atoms
                         if not (b1.display and b2.display):
                             continue
-                        oa = orders.get(frozenset((b1.name, b2.name)))
-                        if oa is not None:
-                            specs.append((b1, b2, oa[0], oa[1]))
+                        key = frozenset((b1.name, b2.name))
+                        oa = orders.get(key)
+                        if oa is None or key in circled_bonds:
+                            continue
+                        specs.append((b1, b2, oa[0], oa[1]))
                     if specs:
-                        self._add_multiplicity_lines(
-                            s, specs, self._model_carbon_color(residue)
-                        )
+                        self._add_multiplicity_lines(s, specs, color)
             except Exception:
                 pass
             residue.structure.add([s])
@@ -1456,14 +1529,19 @@ class NewSectionDialog(UI_Panel_Base):
             self.session.logger.status('')
         self._refresh()
 
-    def open_in_chemsearch(self, residue):
-        '''Open `residue` in the ChimeraX-ChemSearch 2D structure editor: fetch (or
-        create) its singleton panel and seed it from the residue. ChemSearch derives
-        the 2D structure itself from the residue's atoms/bonds -- no conversion is
-        needed here. Best-effort: a missing bundle, a deleted residue, or one
-        ChemSearch cannot derive a structure from (e.g. a lone metal ion) is a
-        logged warning, never an error. NOTE this replaces whatever is currently
-        drawn in the shared ChemSearch panel.'''
+    def open_in_chemsearch(self, residue, unit_residues=None):
+        '''Open a structure in the ChimeraX-ChemSearch 2D editor. Normally seeds the
+        single `residue` (seed_from_residue derives the 2D structure from its own
+        atoms/bonds). For a COVALENT unit -- `unit_residues` holding more than one
+        residue -- the whole unit is instead combined into ONE molecule (the
+        covalent adduct) and seeded as SMILES via seed_from_smiles: a ligand plus
+        the residue it is bonded to is a single real molecule, so it reads and edits
+        as one. Metal sites are never passed a multi-residue set (a metal cluster
+        has no sane single 2D structure), so they seed just their metal residue.
+        Best-effort: a missing bundle, a deleted residue, a ChemSearch too old to
+        accept SMILES, or a structure RDKit cannot combine all fall back (to the
+        single residue) or warn -- never an error. NOTE this replaces whatever is
+        currently drawn in the shared ChemSearch panel.'''
         if residue is None or residue.deleted:
             return
         try:
@@ -1478,8 +1556,20 @@ class NewSectionDialog(UI_Panel_Base):
             return
         try:
             tool = get_singleton(self.session, ChemSearchTool, TOOL_NAME)
-            if tool is not None:
-                tool.seed_from_residue(residue)
+            if tool is None:
+                return
+            # Covalent unit: seed the whole adduct as one combined molecule, when
+            # ChemSearch is new enough to accept SMILES and the combine succeeds.
+            residues = [r for r in (unit_residues or []) if r is not None and not r.deleted]
+            seed_smiles = getattr(tool, 'seed_from_smiles', None)
+            if len(residues) > 1 and seed_smiles is not None:
+                smiles = self._combined_unit_smiles(residues)
+                if smiles:
+                    label = ' + '.join(sorted({r.name for r in residues}))
+                    seed_smiles(smiles, name=label)
+                    return
+                # Combine failed -- fall back to seeding the single seed residue.
+            tool.seed_from_residue(residue)
         except Exception as e:
             self.session.logger.warning(
                 'New section: could not open {} in ChemSearch ({}: {})'.format(
@@ -1487,15 +1577,45 @@ class NewSectionDialog(UI_Panel_Base):
                 )
             )
 
-    # --- bond-multiplicity rendering for the preview ---------------------
+    def _combined_unit_smiles(self, residues):
+        '''Canonical SMILES for a covalent unit's `residues` combined into a single
+        molecule. super_residue_to_rdkit builds one RDKit mol for the set, capping
+        every bond that LEAVES it (so the unit's backbone links to the rest of the
+        chain become caps, not dangling valences) -- i.e. the covalent adduct as a
+        standalone molecule. Hydrogens are dropped (Ketcher re-adds implicit H from
+        the SMILES). None on any failure, so the caller falls back to seeding the
+        single seed residue.'''
+        try:
+            from chimerax.isolde.atomic import rdkit_bridge as rb
+            from rdkit import Chem
+            mol, _cxmap, _info = rb.super_residue_to_rdkit(list(residues))
+            if mol is None:
+                return None
+            try:
+                mol = Chem.RemoveHs(mol)
+            except Exception:
+                pass
+            smiles = Chem.MolToSmiles(mol)
+            return smiles or None
+        except Exception:
+            return None
+
+    # --- chemical-diagram rendering for the preview ----------------------
+    # Two complementary decorations turn the 3D preview into a chemical diagram:
+    # aromatic rings get a dotted inscribed circle (_add_aromatic_ring_circle),
+    # and the remaining double/triple bonds get inner parallel lines
+    # (_add_multiplicity_lines). _build_preview drives both.
     def _add_multiplicity_lines(self, structure, specs, color):
         '''Add inner parallel line(s) for the multiple bonds in `specs` -- a list of
         (atomA, atomB, order, aromatic) within `structure` -- so double / triple /
         aromatic bonds read as a chemical diagram in the preview. Drawn as thin
         helper bonds offset perpendicular to each bond, within the plane of a bonded
-        neighbour (the local sp2 plane): one inner line for a double/aromatic bond,
-        one either side of the central stick for a triple. Shortened at each end
-        (RDKit-style). Helpers live in `structure`, so its deletion tidies them up.'''
+        neighbour (the local sp2 plane): one inner line for a double bond, one
+        either side of the central stick for a triple. Shortened at each end
+        (RDKit-style). Helpers live in `structure`, so its deletion tidies them up.
+        Aromatic *ring* bonds normally reach here already filtered out (they are
+        depicted by _add_aromatic_ring_circle); a stray aromatic bond whose ring was
+        not fully present falls back to a single inner line.'''
         import numpy
         from chimerax.atomic import Atom, Element
         r = PREVIEW_STICK_RADIUS
@@ -1553,6 +1673,61 @@ class NewSectionDialog(UI_Panel_Base):
                 except Exception:
                     pass
 
+    def _add_aromatic_ring_circle(self, structure, atoms, color):
+        '''Draw a dotted circle inscribed in an aromatic ring -- the textbook
+        aromaticity symbol -- from `atoms` (the ring's preview atoms, in ring
+        order). The circle lies in the ring's best-fit plane, is centred on the
+        ring centroid, and has a radius AROMATIC_CIRCLE_FRACTION of the mean
+        atom-to-centroid distance. It is rendered as a ring of small, non-bonded
+        spheres ("dots"), spaced ~AROMATIC_CIRCLE_DOT_SPACING apart, added to
+        `structure` (so its deletion tidies them up). Returns True if a circle was
+        actually drawn. Best-fit plane via SVD so the circle sits cleanly even if
+        the pinned ring is slightly non-planar.'''
+        import numpy
+        from chimerax.atomic import Atom, Element
+        pts = numpy.array([a.coord for a in atoms], dtype=float)
+        if len(pts) < 5:
+            return False
+        centroid = pts.mean(axis=0)
+        centered = pts - centroid
+        # Ring-plane normal = the least-significant right singular vector of the
+        # centred ring coordinates (the direction of least spread).
+        try:
+            _u, _s, vh = numpy.linalg.svd(centered)
+        except Exception:
+            return False
+        normal = vh[2]
+        # An in-plane orthonormal basis (u, v): u is the first atom's in-plane
+        # direction, v completes the right-handed frame in the ring plane.
+        u = centered[0] - numpy.dot(centered[0], normal) * normal
+        nu = float(numpy.linalg.norm(u))
+        if nu < 1e-6:
+            return False
+        u = u / nu
+        v = numpy.cross(normal, u)
+        # Radius = the ring's apothem (mean centroid-to-bond-midpoint distance)
+        # minus a fixed clearance, so the closest bond-to-circle gap is the same
+        # for hexagons and pentagons. `atoms` is in ring-connectivity order (RDKit
+        # AtomRings), so consecutive coords are bonded -- roll by one to pair each
+        # atom with its ring neighbour and take the edge midpoints.
+        edge_mids = (pts + numpy.roll(pts, -1, axis=0)) / 2.0
+        apothem = float(numpy.linalg.norm(edge_mids - centroid, axis=1).mean())
+        radius = apothem - AROMATIC_CIRCLE_GAP
+        if radius < 1e-3:
+            return False
+        n_dots = max(12, int(round(2.0 * pi * radius / AROMATIC_CIRCLE_DOT_SPACING)))
+        dres = atoms[0].residue
+        for k in range(n_dots):
+            theta = 2.0 * pi * k / n_dots
+            p = centroid + radius * (cos(theta) * u + sin(theta) * v)
+            dot = structure.new_atom('ar', Element.get_element('C'))
+            dot.coord = p
+            dres.add_atom(dot)
+            dot.draw_mode = Atom.SPHERE_STYLE
+            dot.radius = AROMATIC_CIRCLE_DOT_RADIUS
+            dot.color = color
+        return True
+
     def _rdkit_bond_orders(self, mol):
         '''{frozenset(name1, name2): (order:int, aromatic:bool)} for the multiple
         (order >= 2 or aromatic) bonds of an RDKit `mol` whose atoms carry the
@@ -1578,6 +1753,34 @@ class NewSectionDialog(UI_Panel_Base):
         except Exception:
             return {}
         return out
+
+    def _rdkit_aromatic_rings(self, mol):
+        '''The 5-/6-membered fully-aromatic rings of an RDKit `mol`, each as a
+        tuple of its atoms' ChimeraX/CCD names (NAME_PROP) in ring order. Used to
+        draw a dotted inscribed circle per aromatic ring in the preview. Empty on
+        any failure, a nameless mol, or a mol whose aromaticity was not perceived
+        (the relaxed-sanitize fallback in rdkit_bridge) -- in which case no circle
+        is drawn, a safe degradation.'''
+        rings = []
+        if mol is None:
+            return rings
+        try:
+            from chimerax.isolde.atomic.rdkit_bridge import NAME_PROP
+        except Exception:
+            return rings
+        try:
+            for ring in mol.GetRingInfo().AtomRings():
+                if len(ring) not in (5, 6):
+                    continue
+                atoms = [mol.GetAtomWithIdx(i) for i in ring]
+                if not all(a.GetIsAromatic() for a in atoms):
+                    continue
+                if not all(a.HasProp(NAME_PROP) for a in atoms):
+                    continue
+                rings.append(tuple(a.GetProp(NAME_PROP) for a in atoms))
+        except Exception:
+            return []
+        return rings
 
     # --- data (FMCS-scored candidate templates) --------------------------
     def _detect(self):
