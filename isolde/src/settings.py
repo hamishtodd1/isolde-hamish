@@ -20,6 +20,7 @@ class _IsoldeBasicSettings(Settings):
 
         'experience_level':                 defaults.EXPERIENCE_LEVEL,
         'preview_camera_snap_distance':     defaults.CAMERA_SNAP_DISTANCE,
+        'focus_isolde_toolbar_tab_at_startup': defaults.FOCUS_ISOLDE_TOOLBAR_TAB_AT_STARTUP,
 
         'phenix_base_path':                 None,
     }
@@ -95,6 +96,18 @@ def register_settings_options(session):
                 '0 to always snap.',
     )
     session.ui.main_window.add_settings_option('ISOLDE', snap_opt)
+
+    from chimerax.ui.options import BooleanOption
+    tab_opt = BooleanOption(
+        'Show ISOLDE toolbar tab at startup',
+        basic_settings.focus_isolde_toolbar_tab_at_startup,
+        None,                                   # persistence is automatic
+        attr_name='focus_isolde_toolbar_tab_at_startup',
+        settings=basic_settings,
+        balloon='When ChimeraX starts, make the ISOLDE tab the current toolbar '
+                'tab instead of Home. Takes effect at the next ChimeraX start.',
+    )
+    session.ui.main_window.add_settings_option('ISOLDE', tab_opt)
 
 basic_settings = None # set during bundle initialisation
 color_settings = None # set during bundle initialisation

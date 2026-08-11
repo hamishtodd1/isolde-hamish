@@ -163,6 +163,9 @@ class _Defaults:
         # Startup experience level: 0=Default, 1=Advanced, 2=Developer
         # (matches ExpertModeSelector in ui/ui_base.py)
         'EXPERIENCE_LEVEL':             0,
+        # Make the ISOLDE ribbon tab the current toolbar tab when ChimeraX
+        # starts, instead of ChimeraX's Home tab.
+        'FOCUS_ISOLDE_TOOLBAR_TAB_AT_STARTUP':  False,
         # Validate -> New Section: hovering a template box flies the camera to
         # that residue. A move shorter than this animates; a longer one snaps
         # instantly (jump + reorient). 0 => always snap. Angstroms.

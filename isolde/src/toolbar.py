@@ -89,6 +89,17 @@ def _rota_command(session, cmd):
     session._isolde_tb._update_rotamer_buttons()
 
 
+def show_isolde_toolbar_tab(session):
+    '''
+    Make the ISOLDE tab the current tab in the ChimeraX ribbon toolbar. Safe
+    no-op if the Toolbar tool isn't running (the user may have removed it from
+    their autostart tools) or if the ISOLDE tab isn't registered yet.
+    '''
+    from chimerax.toolbar.tool import get_toolbar_singleton
+    tb = get_toolbar_singleton(session, create=False)
+    if tb is not None:
+        tb.ttb.show_tab('ISOLDE')
+
 
 class ToolbarButtonMgr:
     # (tab, section, name, display_name)
@@ -135,7 +146,20 @@ class ToolbarButtonMgr:
         self._handlers = defaultdict(list)
         self._last_selected_rotamer = None
         session.triggers.add_handler('new frame', self._set_button_starting_states)
+        session.triggers.add_handler('new frame', self._focus_isolde_tab_if_requested)
         self._initialize_callbacks()
+
+    def _focus_isolde_tab_if_requested(self, *_):
+        # Honour Favourites > Settings > ISOLDE > "Show ISOLDE toolbar tab at
+        # startup". Deferred to the first frame because the Toolbar tool is
+        # built after bundle initialisation, and ends by selecting its own
+        # 'Home' tab - so we must run after it. Separate from
+        # _set_button_starting_states, which also runs when ISOLDE closes.
+        from .settings import basic_settings
+        if getattr(basic_settings, 'focus_isolde_toolbar_tab_at_startup', False):
+            show_isolde_toolbar_tab(self.session)
+        from chimerax.core.triggerset import DEREGISTER
+        return DEREGISTER
 
     def _set_button_starting_states(self, *_):
         try:
