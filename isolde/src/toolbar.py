@@ -165,7 +165,12 @@ class ToolbarButtonMgr:
         try:
             for key, (tab, section, name, display_name) in self.all_buttons.items():
                 if key == 'Start ISOLDE':
-                    self.set_enabled(key, True)
+                    # Normally ISOLDE cannot yet be running when this first-frame
+                    # handler fires, but if the user has ISOLDE in their ChimeraX
+                    # autostart list the tool is built during main-window
+                    # construction - i.e. before any frame - and has already
+                    # disabled this button via isolde_started(). Don't undo that.
+                    self.set_enabled(key, not hasattr(self.session, 'isolde'))
                 else:
                     self.set_enabled(key, False)
         except ValueError:

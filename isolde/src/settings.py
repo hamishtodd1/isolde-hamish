@@ -21,6 +21,7 @@ class _IsoldeBasicSettings(Settings):
         'experience_level':                 defaults.EXPERIENCE_LEVEL,
         'preview_camera_snap_distance':     defaults.CAMERA_SNAP_DISTANCE,
         'focus_isolde_toolbar_tab_at_startup': defaults.FOCUS_ISOLDE_TOOLBAR_TAB_AT_STARTUP,
+        'start_isolde_at_startup':          defaults.START_ISOLDE_AT_STARTUP,
 
         'phenix_base_path':                 None,
     }
@@ -108,6 +109,32 @@ def register_settings_options(session):
                 'tab instead of Home. Takes effect at the next ChimeraX start.',
     )
     session.ui.main_window.add_settings_option('ISOLDE', tab_opt)
+
+    # What actually starts the tool is ChimeraX's own autostart list
+    # (session.ui.settings.autostart), which can also be edited from a tool's
+    # context menu or with 'ui autostart' - so treat that list as the truth and
+    # re-sync our setting from it here, before the option (and hence its
+    # callback) exists. The setting is needed as well: this settings page's
+    # Save/Reset/Restore buttons dereference opt.settings and opt.attr_name for
+    # every option on the page, so a callback-only option raises a TypeError
+    # there.
+    autostart_on = 'ISOLDE' in session.ui.settings.autostart
+    if basic_settings.start_isolde_at_startup != autostart_on:
+        basic_settings.start_isolde_at_startup = autostart_on
+    def _set_isolde_autostart(opt, session=session):
+        from chimerax.core.commands import run
+        run(session, 'ui autostart %s ISOLDE' % ('true' if opt.value else 'false'))
+    autostart_opt = BooleanOption(
+        'Start ISOLDE at ChimeraX startup',
+        basic_settings.start_isolde_at_startup,
+        _set_isolde_autostart,
+        attr_name='start_isolde_at_startup',
+        settings=basic_settings,
+        balloon='Open the ISOLDE panel automatically each time ChimeraX starts. '
+                'Equivalent to the "ui autostart true ISOLDE" command. Takes '
+                'effect at the next ChimeraX start.',
+    )
+    session.ui.main_window.add_settings_option('ISOLDE', autostart_opt)
 
 basic_settings = None # set during bundle initialisation
 color_settings = None # set during bundle initialisation

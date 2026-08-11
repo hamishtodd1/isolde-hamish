@@ -166,6 +166,9 @@ class _Defaults:
         # Make the ISOLDE ribbon tab the current toolbar tab when ChimeraX
         # starts, instead of ChimeraX's Home tab.
         'FOCUS_ISOLDE_TOOLBAR_TAB_AT_STARTUP':  False,
+        # Open the ISOLDE panel automatically at ChimeraX startup. Mirrors
+        # ChimeraX's own autostart list, which is what actually starts the tool.
+        'START_ISOLDE_AT_STARTUP':      False,
         # Validate -> New Section: hovering a template box flies the camera to
         # that residue. A move shorter than this animates; a longer one snaps
         # instantly (jump + reorient). 0 => always snap. Angstroms.
