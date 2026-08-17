@@ -166,6 +166,23 @@ AROMATIC_CIRCLE_GAP = 0.3
 AROMATIC_CIRCLE_DOT_SPACING = 0.2
 AROMATIC_CIRCLE_DOT_RADIUS = 0.07
 
+# Delocalized-anion (resonance / charge) markup: a carboxylate -- and related
+# groups with >=2 equivalent deprotonated terminal oxygens (phosphate, sulfate,
+# nitro) -- is drawn with a dotted quadratic-Bezier arc through the angle between
+# two central-oxygen bonds, the textbook resonance symbol (minus the sign). The
+# curve's endpoints sit CHARGE_ARC_END_FRACTION along each bond and are displaced
+# CHARGE_ARC_GAP perpendicular into the O-C-O interior (so they don't touch the
+# sticks -- like the double-bond inner lines); the Bezier control point is the
+# intersection of the two bond-parallel lines through those endpoints, so the
+# curve is TANGENT to each bond at its end. END_FRACTION 1.0 keeps the ends level
+# with the oxygens -- the perpendicular gap alone keeps them off the atoms. Dots are
+# spaced ~CHARGE_ARC_DOT_SPACING apart, each of radius CHARGE_ARC_DOT_RADIUS
+# (see _add_charge_arc).
+CHARGE_ARC_END_FRACTION = 1.0
+CHARGE_ARC_GAP = 0.231
+CHARGE_ARC_DOT_SPACING = 0.2
+CHARGE_ARC_DOT_RADIUS = 0.07
+
 
 def _ease_in_out_sine(t):
     '''Ease-in-out on a fraction t in [0, 1]: zero derivative (hence zero
@@ -174,32 +191,46 @@ def _ease_in_out_sine(t):
 
 
 def _framing_point(residue):
-    '''The residue's framing point in SCENE coordinates -- the CA for an amino
-    acid, C1' for a nucleotide, else the atom centroid -- matching what
-    ResidueStepper centres on. None if the residue has no atoms.'''
+    '''The residue's framing point in SCENE coordinates -- EXACTLY the point
+    navigate.ResidueStepper centres the view on, so the underline / already-centred
+    checks agree with where the camera actually parks: the CA of an amino acid (when
+    its N/CA/C backbone is complete), the C1' of a nucleotide (when its C2'/C1'/O4'
+    are complete), otherwise the atom centroid. The polymer_type gate is what
+    matters for a non-polymer ligand that merely happens to contain a "CA"/"C1'"
+    atom -- e.g. FAD, whose ribityl/ribose carry a C1': it is PT_NONE, so it frames
+    on its centroid (as the stepper does), NOT on that stray atom off on one arm of
+    the molecule. None if the residue has no atoms.'''
     import numpy
+    from chimerax.atomic import Residue
     atoms = residue.atoms
     if not len(atoms):
         return None
-    ref = residue.find_atom('CA') or residue.find_atom("C1'")
-    pt = ref.scene_coord if ref is not None else atoms.scene_coords.mean(axis=0)
-    return numpy.asarray(pt, dtype=float)
+    ref = None
+    pt = residue.polymer_type
+    if pt == Residue.PT_AMINO:
+        key = [residue.find_atom(n) for n in ('N', 'CA', 'C')]
+        if None not in key:
+            ref = key[1]  # CA
+    elif pt == Residue.PT_NUCLEIC:
+        key = [residue.find_atom(n) for n in ("C2'", "C1'", "O4'")]
+        if None not in key:
+            ref = key[1]  # C1'
+    coord = ref.scene_coord if ref is not None else atoms.scene_coords.mean(axis=0)
+    return numpy.asarray(coord, dtype=float)
 
 
 def _residue_is_centred(residue):
-    '''True if the residue's framing point is already near the centre of the
-    view: within CAMERA_CENTERED_FRACTION of the view axis, in front of the
-    camera. The framing point matches what ResidueStepper actually centres on --
-    the CA for an amino acid, C1' for a nucleotide, else the centroid -- NOT the
-    mean of all atoms (whose offset from the CA would make a CA-centred residue
-    read as off-centre and needlessly re-rotate). Orientation-independent, so a
-    reorientation that keeps the residue framed is left undisturbed.'''
+    '''True if the residue's framing point (see _framing_point -- the exact point
+    ResidueStepper centres on) is already near the centre of the view: within
+    CAMERA_CENTERED_FRACTION of the view axis, in front of the camera. Using the
+    stepper's framing point rather than the mean of all atoms means a CA-centred
+    residue you are already looking straight at does not read as off-centre and
+    needlessly re-rotate. Orientation-independent, so a reorientation that keeps the
+    residue framed is left undisturbed.'''
     import numpy
-    atoms = residue.atoms
-    if not len(atoms):
+    point = _framing_point(residue)
+    if point is None:
         return False
-    ref = residue.find_atom('CA') or residue.find_atom("C1'")
-    point = ref.scene_coord if ref is not None else atoms.scene_coords.mean(axis=0)
     cam = residue.structure.session.main_view.camera
     to_res = point - cam.position.origin()
     view_dir = cam.view_direction()
@@ -772,17 +803,20 @@ class NewSectionDialog(UI_Panel_Base):
         # Row name-labels (ResidueNameLabel), so _on_frame_drawn can underline the
         # one whose residue sits at the centre of rotation. Rebuilt each populate.
         self._name_labels = []
-        # Scene-coord framing point of the residue whose preview is currently shown;
-        # the preview is dropped once the centre of rotation moves away from it --
-        # but only after it has first ARRIVED there (_preview_settled), so the
-        # fly-in to a freshly-shown preview doesn't immediately discard it.
-        self._preview_center = None
-        self._preview_settled = False
-        # Cheap change-detection: the focus/preview-drop check only recomputes when
-        # the centre of rotation actually moved (its bytes differ).
+        # Cheap change-detection for the underline: _on_frame_drawn only recomputes
+        # which label to underline when the centre of rotation actually moved (its
+        # bytes differ). The preview is NOT dropped on camera movement any more.
         self._last_cofr_key = None
         self._frame_handler = self.session.triggers.add_handler(
             'frame drawn', self._on_frame_drawn
+        )
+        # A shown preview now persists across camera moves; it is given up only when
+        # the selection is no longer exactly its residue -- mirroring how a rotamer
+        # preview is dropped (see toolbar._update_rotamer_buttons), driven by the
+        # same SELECTION_CHANGED trigger.
+        from chimerax.core.selection import SELECTION_CHANGED
+        self._sel_handler = self.session.triggers.add_handler(
+            SELECTION_CHANGED, self._on_selection_changed
         )
         # Whether the optional ChimeraX-ChemSearch bundle is importable; probed
         # once, lazily, by _chemsearch_available (None => not yet probed).
@@ -813,6 +847,9 @@ class NewSectionDialog(UI_Panel_Base):
         if self._frame_handler is not None:
             self.session.triggers.remove_handler(self._frame_handler)
             self._frame_handler = None
+        if self._sel_handler is not None:
+            self.session.triggers.remove_handler(self._sel_handler)
+            self._sel_handler = None
         super().cleanup()
 
     def _refresh(self, *_):
@@ -1081,23 +1118,14 @@ class NewSectionDialog(UI_Panel_Base):
                 # residue's own bonds to its neighbours hide with it, so the chain
                 # link is redrawn as stub atoms/bonds in _build_preview.
                 self._hide_replaced(row.residue)
-                # Remember where this residue sits so _on_frame_drawn can drop the
-                # preview once the centre of rotation moves off it. Seed "settled"
-                # from the CURRENT CofR: if we are already centred here (the fly
-                # will be skipped, so the CofR won't change to re-arm it) the drop
-                # is armed immediately; otherwise it arms when the fly-in arrives.
-                self._preview_center = _framing_point(row.residue)
-                self._preview_settled = False
-                try:
-                    import numpy
-                    c = self.session.main_view.center_of_rotation
-                    self._preview_settled = (
-                        self._preview_center is not None and c is not None and numpy.linalg.
-                        norm(numpy.asarray(c, dtype=float) - self._preview_center)
-                        < COFR_MATCH_DISTANCE
-                    )
-                except Exception:
-                    pass
+                # Make this residue the sole selection, so the preview's lifetime is
+                # tied to the selection (dropped by _on_selection_changed when the
+                # selection moves off it) rather than to the camera. The hover path
+                # also flies here; the arrow-cycle path does not, so selecting here
+                # covers both. Best-effort -- a preview with no selection just can't
+                # be given up by selection change (still replaced by another hover).
+                if row.residue is not None and not row.residue.deleted:
+                    _select_residue(row.residue)
 
     def remove_preview(self, row=None):
         # Ignore stale calls from a row that no longer owns the preview.
@@ -1108,8 +1136,6 @@ class NewSectionDialog(UI_Panel_Base):
 
     def _delete_preview_structure(self):
         self._restore_replaced()
-        self._preview_center = None
-        self._preview_settled = False
         s = self._preview_structure
         self._preview_structure = None
         if s is not None and not s.deleted:
@@ -1117,9 +1143,9 @@ class NewSectionDialog(UI_Panel_Base):
 
     def _drop_preview(self):
         # Fully drop the current preview: clear the owning row's grey outline and
-        # armed accept button, then remove the structure. Used when the centre of
-        # rotation moves off the previewed residue (the preview is no longer
-        # discarded on a mere mouse-leave).
+        # armed accept button, then remove the structure. Used when the selection
+        # moves off the previewed residue (see _on_selection_changed); the preview
+        # is not discarded on a mouse-leave or on camera movement.
         row = self._preview_row
         if row is not None:
             try:
@@ -1161,10 +1187,10 @@ class NewSectionDialog(UI_Panel_Base):
 
     def _on_frame_drawn(self, *_):
         '''On each drawn frame -- but only when the centre of rotation actually
-        moved (O(1) otherwise) -- (a) underline the listed residue now sitting at
-        the centre of rotation, and (b) drop the current preview once the centre of
-        rotation has moved off the residue it previews. Previews persist across
-        mouse-leaves now; moving the view away is what discards them.'''
+        moved (O(1) otherwise) -- underline the listed residue now sitting at the
+        centre of rotation. This ONLY drives the underline; the preview is no longer
+        dropped on camera movement (a preview persists however far you move, and is
+        given up only by _on_selection_changed).'''
         if self._deleted or self.container.is_collapsed:
             return
         import numpy
@@ -1177,7 +1203,7 @@ class NewSectionDialog(UI_Panel_Base):
         if key == self._last_cofr_key:
             return
         self._last_cofr_key = key
-        # (a) underline the residue whose framing point is at the centre of rotation
+        # Underline the residue whose framing point is at the centre of rotation.
         for lbl in self._name_labels:
             r = lbl.residue
             focused = False
@@ -1189,14 +1215,27 @@ class NewSectionDialog(UI_Panel_Base):
                 lbl.set_focused(focused)
             except RuntimeError:
                 pass  # label destroyed under us; next populate rebuilds the list
-        # (b) drop the kept preview once the centre of rotation leaves its residue,
-        # but only after it has first arrived there (so the fly-in, which sweeps the
-        # CofR in from afar, doesn't discard the preview it just created).
-        if self._preview_center is not None and cofr is not None:
-            if numpy.linalg.norm(cofr - self._preview_center) < COFR_MATCH_DISTANCE:
-                self._preview_settled = True
-            elif self._preview_settled:
-                self._drop_preview()
+
+    def _on_selection_changed(self, *_):
+        '''Give up the current preview once the selection is no longer exactly the
+        residue it stands for -- the same rule that drops a rotamer preview
+        (toolbar._update_rotamer_buttons): the preview is created with its residue as
+        the sole selection (see show_preview), so any move to a different residue, a
+        multi-residue selection, or a clear discards it. Camera movement never
+        triggers this, so a preview survives moving arbitrarily far away.'''
+        if self._deleted:
+            return
+        row = self._preview_row
+        if row is None:
+            return
+        r = row.residue
+        if r is None or r.deleted or r.structure is None or r.structure.deleted:
+            self._drop_preview()
+            return
+        m = r.structure
+        sel = m.residues[m.residues.selected]
+        if len(sel) != 1 or sel[0] != r:
+            self._drop_preview()
 
     def _leaving_atom_names(self, ccd_name):
         '''CCD atom names flagged ``pdbx_leaving_atom_flag == 'Y'`` for `ccd_name`
@@ -1330,6 +1369,35 @@ class NewSectionDialog(UI_Panel_Base):
                 carbons.colors = self._model_carbon_color(residue)
             s.bonds.radii = PREVIEW_STICK_RADIUS
             s.bonds.halfbonds = True
+            # Make the preview's hydrogens mirror the MODEL's. The CCD ideal is the
+            # neutral, fully-protonated form and its H names rarely match the model's,
+            # so the carry-along above places template H by a translation that ignores
+            # the model's LOCAL orientation -- leaving some visibly wrong -- and shows
+            # acidic H the model lacks (deprotonated phosphates/carboxylates at ~pH 7).
+            # For each heavy atom shared with the model, pin its template hydrogens
+            # straight onto the model's own hydrogen coordinates (authoritative for
+            # the model), pairing by list order -- appearance only, so symmetric H
+            # (methyl/methylene) need no true matching -- and hide any template H
+            # beyond the model's count (the model leaves that position unprotonated;
+            # a hidden atom's bonds hide with it, so no stub is left behind). H on a
+            # template-only heavy atom (absent from the model) keep their carried
+            # geometry.
+            try:
+                for th in s.atoms:
+                    if th.element.number == 1:
+                        continue
+                    model_heavy = res_by_name.get(th.name)
+                    if model_heavy is None:
+                        continue
+                    t_hs = [nb for nb in th.neighbors if nb.element.number == 1]
+                    m_hs = [nb for nb in model_heavy.neighbors if nb.element.number == 1]
+                    for k, h in enumerate(t_hs):
+                        if k < len(m_hs):
+                            h.coord = m_hs[k].coord
+                        else:
+                            h.display = False
+            except Exception:
+                pass
             # The residue is hidden while its preview shows, so its own bonds to the
             # neighbouring residues vanish. Redraw that link with short stub bonds
             # INSIDE the preview structure: for each preview atom whose model twin
@@ -1404,30 +1472,32 @@ class NewSectionDialog(UI_Panel_Base):
                         hs[0].coord = n - bis / bl * 1.01
             except Exception:
                 pass
-            # Turn the preview into a chemical diagram even in the ordinary 3D
-            # view: aromatic rings get a dotted inscribed circle (textbook
-            # notation), and the remaining double/triple bonds get inner parallel
-            # line(s). Both come from the template's RDKit mol, matched to the
-            # preview atoms by name. An aromatic-ring bond is depicted by its
-            # circle, so it is excluded from the inner-line pass -- unless its ring
-            # is only partly present (leaving atoms hidden), in which case no circle
-            # was drawn and the bond falls back to a single inner line. Best-effort.
+            # Turn the preview into a chemical diagram even in the ordinary 3D view:
+            # aromatic rings get a dotted inscribed circle, delocalized anions
+            # (carboxylate & co.) get a dotted resonance arc through the bond angle,
+            # and the REMAINING double/triple bonds get inner parallel line(s). The
+            # aromatic/bond-order info comes from the template's RDKit mol; the anion
+            # detection comes from the MODEL's protonation. A bond already depicted by
+            # a circle or an arc is excluded from the inner-line pass -- except an
+            # aromatic ring only partly present draws no circle, so its bonds fall
+            # back to a single inner line. Best-effort.
             try:
                 mol = self._template_mol(ccd_name)
-                color = self._model_carbon_color(residue)
                 prev_by_name = {a.name: a for a in s.atoms}
-                # (a) Aromatic rings -> dotted circles. Record the bonds of every
-                # ring we actually drew, so the inner-line pass skips them.
-                circled_bonds = set()
+                # bonds shown by a circle or an arc, so NOT also by an inner line
+                decorated_bonds = set()
+                # (a) Aromatic rings -> dotted inscribed circles.
                 for ring in self._rdkit_aromatic_rings(mol):
                     ring_atoms = [prev_by_name.get(n) for n in ring]
                     if any(a is None or not a.display for a in ring_atoms):
                         continue  # ring not fully present -> no sensible circle
-                    if self._add_aromatic_ring_circle(s, ring_atoms, color):
+                    if self._add_aromatic_ring_circle(s, ring_atoms):
                         n = len(ring)
                         for i in range(n):
-                            circled_bonds.add(frozenset((ring[i], ring[(i + 1) % n])))
-                # (b) Remaining multiple bonds -> inner parallel line(s).
+                            decorated_bonds.add(frozenset((ring[i], ring[(i + 1) % n])))
+                # (b) Delocalized anions -> dotted resonance arcs.
+                decorated_bonds |= self._add_charge_arcs(s, residue, prev_by_name)
+                # (c) Remaining multiple bonds -> inner parallel line(s).
                 orders = self._rdkit_bond_orders(mol)
                 if orders:
                     specs = []
@@ -1437,11 +1507,11 @@ class NewSectionDialog(UI_Panel_Base):
                             continue
                         key = frozenset((b1.name, b2.name))
                         oa = orders.get(key)
-                        if oa is None or key in circled_bonds:
+                        if oa is None or key in decorated_bonds:
                             continue
                         specs.append((b1, b2, oa[0], oa[1]))
                     if specs:
-                        self._add_multiplicity_lines(s, specs, color)
+                        self._add_multiplicity_lines(s, specs)
             except Exception:
                 pass
             residue.structure.add([s])
@@ -1605,17 +1675,18 @@ class NewSectionDialog(UI_Panel_Base):
     # aromatic rings get a dotted inscribed circle (_add_aromatic_ring_circle),
     # and the remaining double/triple bonds get inner parallel lines
     # (_add_multiplicity_lines). _build_preview drives both.
-    def _add_multiplicity_lines(self, structure, specs, color):
+    def _add_multiplicity_lines(self, structure, specs):
         '''Add inner parallel line(s) for the multiple bonds in `specs` -- a list of
         (atomA, atomB, order, aromatic) within `structure` -- so double / triple /
         aromatic bonds read as a chemical diagram in the preview. Drawn as thin
         helper bonds offset perpendicular to each bond, within the plane of a bonded
         neighbour (the local sp2 plane): one inner line for a double bond, one
         either side of the central stick for a triple. Shortened at each end
-        (RDKit-style). Helpers live in `structure`, so its deletion tidies them up.
-        Aromatic *ring* bonds normally reach here already filtered out (they are
-        depicted by _add_aromatic_ring_circle); a stray aromatic bond whose ring was
-        not fully present falls back to a single inner line.'''
+        (RDKit-style), and half-bond coloured from the two real atoms so each inner
+        line matches its bond's colouring. Helpers live in `structure`, so its
+        deletion tidies them up. Aromatic *ring* bonds normally reach here already
+        filtered out (they are depicted by _add_aromatic_ring_circle); a stray
+        aromatic bond whose ring was not fully present falls back to an inner line.'''
         import numpy
         from chimerax.atomic import Atom, Element
         r = PREVIEW_STICK_RADIUS
@@ -1661,28 +1732,33 @@ class NewSectionDialog(UI_Panel_Base):
                 h2 = structure.new_atom('d', Element.get_element('C'))
                 h2.coord = pb2 + off * sgn
                 dres.add_atom(h2)
+                # Colour each half by the atom it sits nearest (h1<->a, h2<->b) and
+                # draw the inner line as a half-bond, so it matches the real bond's
+                # colouring -- two colours across a heteroatom bond such as C=O.
+                h1.color = a.color
+                h2.color = b.color
                 for h in (h1, h2):
                     h.draw_mode = Atom.STICK_STYLE
                     h.radius = r
-                    h.color = color
                 try:
                     bd = structure.new_bond(h1, h2)
                     bd.radius = r
-                    bd.halfbond = False
-                    bd.color = color
+                    bd.halfbond = True
                 except Exception:
                     pass
 
-    def _add_aromatic_ring_circle(self, structure, atoms, color):
+    def _add_aromatic_ring_circle(self, structure, atoms):
         '''Draw a dotted circle inscribed in an aromatic ring -- the textbook
         aromaticity symbol -- from `atoms` (the ring's preview atoms, in ring
-        order). The circle lies in the ring's best-fit plane, is centred on the
-        ring centroid, and has a radius AROMATIC_CIRCLE_FRACTION of the mean
-        atom-to-centroid distance. It is rendered as a ring of small, non-bonded
-        spheres ("dots"), spaced ~AROMATIC_CIRCLE_DOT_SPACING apart, added to
-        `structure` (so its deletion tidies them up). Returns True if a circle was
-        actually drawn. Best-fit plane via SVD so the circle sits cleanly even if
-        the pinned ring is slightly non-planar.'''
+        order). The circle lies in the ring's best-fit plane, is centred on the ring
+        centroid, and has a radius of the ring's apothem minus AROMATIC_CIRCLE_GAP.
+        It is rendered as a ring of small, non-bonded spheres ("dots"), spaced
+        ~AROMATIC_CIRCLE_DOT_SPACING apart, added to `structure` (so its deletion
+        tidies them up). Each dot takes the colour of its nearest ring atom, so the
+        circle matches the ring's composition (an all-carbon ring stays one colour;
+        a heteroaromatic ring shows its N/O). Returns True if a circle was actually
+        drawn. Best-fit plane via SVD so the circle sits cleanly even if the pinned
+        ring is slightly non-planar.'''
         import numpy
         from chimerax.atomic import Atom, Element
         pts = numpy.array([a.coord for a in atoms], dtype=float)
@@ -1717,6 +1793,7 @@ class NewSectionDialog(UI_Panel_Base):
             return False
         n_dots = max(12, int(round(2.0 * pi * radius / AROMATIC_CIRCLE_DOT_SPACING)))
         dres = atoms[0].residue
+        atom_colors = [a.color for a in atoms]
         for k in range(n_dots):
             theta = 2.0 * pi * k / n_dots
             p = centroid + radius * (cos(theta) * u + sin(theta) * v)
@@ -1725,7 +1802,120 @@ class NewSectionDialog(UI_Panel_Base):
             dres.add_atom(dot)
             dot.draw_mode = Atom.SPHERE_STYLE
             dot.radius = AROMATIC_CIRCLE_DOT_RADIUS
-            dot.color = color
+            # Colour by the nearest ring atom, so the circle reads the ring's makeup.
+            dot.color = atom_colors[int(((pts - p)**2).sum(axis=1).argmin())]
+        return True
+
+    def _add_charge_arcs(self, structure, residue, prev_by_name):
+        '''Draw a dotted resonance arc for each delocalized-anion centre in
+        `residue` -- a central atom (C/N/P/S) with >=2 terminal oxygens that carry
+        no hydrogen in the model (a deprotonated carboxylate, phosphate, sulfate,
+        nitro...) -- one arc through the angle between each pair of those
+        central-oxygen bonds. Detection uses the MODEL's protonation (the preview
+        now mirrors it), so a protonated -COOH, whose second oxygen still bears an
+        H, has only one deprotonated terminal O and draws no arc. Returns the set of
+        frozenset(name pairs) of the central-oxygen bonds that got an arc, so the
+        inner-line pass can skip them (the arc, not a double-bond line, depicts the
+        delocalization).'''
+        decorated = set()
+        for central in residue.atoms:
+            if central.element.number not in (6, 7, 15, 16):  # C, N, P, S
+                continue
+            deloc = []
+            for nb in central.neighbors:
+                if nb.element.number != 8:  # oxygen
+                    continue
+                # terminal (no heavy neighbour other than `central`) AND deprotonated
+                if any(o2.element.number != 1 and o2 is not central for o2 in nb.neighbors):
+                    continue
+                if any(o2.element.number == 1 for o2 in nb.neighbors):
+                    continue
+                deloc.append(nb)
+            if len(deloc) < 2:
+                continue
+            pc = prev_by_name.get(central.name)
+            if pc is None or not pc.display:
+                continue
+            p_os = [prev_by_name.get(o.name) for o in deloc]
+            p_os = [o for o in p_os if o is not None and o.display]
+            for i in range(len(p_os)):
+                for j in range(i + 1, len(p_os)):
+                    if self._add_charge_arc(structure, pc, p_os[i], p_os[j]):
+                        decorated.add(frozenset((pc.name, p_os[i].name)))
+                        decorated.add(frozenset((pc.name, p_os[j].name)))
+        return decorated
+
+    def _add_charge_arc(self, structure, central, o_a, o_b):
+        '''Draw a dotted quadratic-Bezier arc through the angle o_a--central--o_b
+        (the delocalized-anion / resonance symbol) into `structure`. The endpoints
+        sit CHARGE_ARC_END_FRACTION along each central-oxygen bond, displaced
+        CHARGE_ARC_GAP perpendicular into the interior of the angle (so they clear
+        the sticks -- like the double-bond inner lines). The control point is the
+        intersection of the two bond-parallel lines through those endpoints, so the
+        curve is TANGENT to each bond at its end: its start/end tangents run ALONG
+        the bonds, not across them (a circular arc, centred on the vertex, would
+        cross them perpendicularly). Dots are coloured to mirror the two half-bonds
+        the arc stands in for -- outer quarters take the oxygens' colour, the central
+        half the central atom's -- so it matches the real bond colouring. Returns
+        True if drawn.'''
+        import numpy
+        from chimerax.atomic import Atom, Element
+        x = numpy.asarray(central.coord, dtype=float)
+        va = numpy.asarray(o_a.coord, dtype=float) - x
+        vb = numpy.asarray(o_b.coord, dtype=float) - x
+        la = float(numpy.linalg.norm(va))
+        lb = float(numpy.linalg.norm(vb))
+        if la < 1e-6 or lb < 1e-6:
+            return False
+        ua = va / la
+        ub = vb / lb
+        c = float(numpy.dot(ua, ub))
+        if abs(c) > 0.999:  # bonds (anti)parallel -> no well-defined interior arc
+            return False
+        bis = ua + ub
+        nbis = float(numpy.linalg.norm(bis))
+        if nbis < 1e-6:  # ~180 degrees -> no interior to nestle into
+            return False
+        bis = bis / nbis
+        # Perpendicular directions from each bond toward the interior (the bisector).
+        perp_a = bis - numpy.dot(bis, ua) * ua
+        perp_b = bis - numpy.dot(bis, ub) * ub
+        npa = float(numpy.linalg.norm(perp_a))
+        npb = float(numpy.linalg.norm(perp_b))
+        if npa < 1e-6 or npb < 1e-6:
+            return False
+        perp_a = perp_a / npa
+        perp_b = perp_b / npb
+        # Endpoints: inset along each bond + displaced perpendicular into the interior.
+        p0 = x + CHARGE_ARC_END_FRACTION * la * ua + CHARGE_ARC_GAP * perp_a
+        p2 = x + CHARGE_ARC_END_FRACTION * lb * ub + CHARGE_ARC_GAP * perp_b
+        # Control point P1 = intersection of the line through p0 along ua and the
+        # line through p2 along ub, i.e. p0 + alpha*ua == p2 + beta*ub. Then
+        # (P1-p0) || ua and (p2-P1) || ub, so the Bezier is tangent to both bonds.
+        e = p2 - p0
+        beta = (float(numpy.dot(e, ub)) - c * float(numpy.dot(e, ua))) / (c * c - 1.0)
+        alpha = float(numpy.dot(e, ua)) + beta * c
+        p1 = p0 + alpha * ua
+        # Dot count from the control-polygon length (an upper bound on the arc).
+        length = float(numpy.linalg.norm(p1 - p0)) + float(numpy.linalg.norm(p2 - p1))
+        n_dots = max(4, int(round(length / CHARGE_ARC_DOT_SPACING)))
+        dres = central.residue
+        # Colour like the two half-bonds the arc stands in for: the outer quarters
+        # (nearest each oxygen) take that oxygen's colour, the central half the
+        # central atom's -- so a phosphate reads O-red / P / O-red across the arc.
+        col_a = o_a.color
+        col_b = o_b.color
+        col_c = central.color
+        for k in range(n_dots):
+            t = k / (n_dots - 1)
+            mt = 1.0 - t
+            pt = mt * mt * p0 + 2.0 * mt * t * p1 + t * t * p2
+            dot = structure.new_atom('cq', Element.get_element('C'))
+            dot.coord = pt
+            dres.add_atom(dot)
+            dot.draw_mode = Atom.SPHERE_STYLE
+            dot.radius = CHARGE_ARC_DOT_RADIUS
+            dot.color = col_a if t < 0.25 else (col_b if t > 0.75 else col_c)
         return True
 
     def _rdkit_bond_orders(self, mol):
@@ -1815,6 +2005,18 @@ class NewSectionDialog(UI_Panel_Base):
             template_dict = find_residue_templates(
                 residues, ff, ligand_db=ligand_db, logger=self.session.logger
             )
+            # Guard against a half-finished parameterisation. A metal-site / ligand
+            # run can tag a residue with a template name that was never actually
+            # loaded into the forcefield (e.g. 'MC_CYF' from an interrupted iron-
+            # sulfur build). Passing such a name on to assignTemplates raises a
+            # KeyError that aborts detection for EVERY residue -- collapsing the whole
+            # panel to just the Scan button. Drop any name the forcefield doesn't
+            # know, so the offending residue falls through to normal unmatched
+            # detection (it IS unparameterised -- its template load failed) and the
+            # rest of the list still populates. Read-only: the stale override on the
+            # model is left for the sim-build path (clear_failed_overrides) to clear.
+            known = set(ff._templates.keys())
+            template_dict = {i: n for i, n in template_dict.items() if n in known}
             top, residue_templates = create_openmm_topology(residues.atoms, template_dict)
             _, ambiguous, unmatched = ff.assignTemplates(
                 top, ignoreExternalBonds=True, explicit_templates=residue_templates
