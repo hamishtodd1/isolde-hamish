@@ -81,8 +81,37 @@ class ISOLDE_ToolUI(ToolInstance):
         register_splash(splash)
         from time import time
         start_time = [time()]
+        def _modal_dialog_up():
+            # ChimeraX's registration reminder (chimerax.registration.nag) and
+            # other startup dialogs are application-modal. This splash is
+            # always-on-top, so it would sit over them and swallow their clicks.
+            from Qt.QtWidgets import QApplication
+            return QApplication.activeModalWidget() is not None
+        # Keep the splash out of the way of modal dialogs. This has to be driven
+        # by a timer, NOT by the 'new frame' trigger: a modal dialog spins its own
+        # nested Qt event loop, during which ChimeraX stops rendering, so no 'new
+        # frame' triggers fire until the dialog is dismissed - by which time the
+        # damage is done. Qt timers do still fire in a nested loop.
+        from Qt.QtCore import QTimer
+        modal_watch = self._splash_modal_watch = QTimer()
+        def _yield_to_modal_dialogs(splash=splash, start_time=start_time):
+            from time import time
+            if _modal_dialog_up():
+                if not splash.isHidden():
+                    splash.hide()
+                # Restart the countdown, so the splash still gets its moment on
+                # screen once the dialog has been dealt with.
+                start_time[0] = time()
+            elif splash.isHidden():
+                splash.show()
+        modal_watch.timeout.connect(_yield_to_modal_dialogs)
+        modal_watch.start(100)
         def _splash_remove_cb(trigger_name, data, start_time=start_time, min_time=2):
             from time import time
+            if splash.isHidden():
+                # A modal dialog is up; the watcher above owns visibility and has
+                # reset the countdown, so just wait it out.
+                return
             elapsed_time = time()-start_time[0]
             if elapsed_time > min_time:
                 start_time[0] = time()
@@ -93,7 +122,11 @@ class ISOLDE_ToolUI(ToolInstance):
             from time import time
             et = time()-start_time[0]
             opacity = 1-et/fade_time
+            if _modal_dialog_up():
+                # Don't linger in front of a modal dialog to finish an animation
+                opacity = 0
             if opacity <= 0:
+                modal_watch.stop()
                 splash.close()
                 from .dialog import register_splash
                 register_splash(None)

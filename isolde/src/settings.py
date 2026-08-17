@@ -110,31 +110,28 @@ def register_settings_options(session):
     )
     session.ui.main_window.add_settings_option('ISOLDE', tab_opt)
 
-    # What actually starts the tool is ChimeraX's own autostart list
-    # (session.ui.settings.autostart), which can also be edited from a tool's
-    # context menu or with 'ui autostart' - so treat that list as the truth and
-    # re-sync our setting from it here, before the option (and hence its
-    # callback) exists. The setting is needed as well: this settings page's
-    # Save/Reset/Restore buttons dereference opt.settings and opt.attr_name for
-    # every option on the page, so a callback-only option raises a TypeError
-    # there.
-    autostart_on = 'ISOLDE' in session.ui.settings.autostart
-    if basic_settings.start_isolde_at_startup != autostart_on:
-        basic_settings.start_isolde_at_startup = autostart_on
-    def _set_isolde_autostart(opt, session=session):
+    # One-time migration. An earlier version implemented this setting by putting
+    # ISOLDE into ChimeraX's own autostart list. That list builds the tool during
+    # main-window construction - before any frame - so ISOLDE's always-on-top
+    # splash ended up covering the ChimeraX registration reminder (and any other
+    # startup dialog) and swallowing its clicks. Move such an entry over to our
+    # own deferred mechanism, which waits for those dialogs first. Same outcome
+    # for the user, minus the interference.
+    if 'ISOLDE' in session.ui.settings.autostart:
+        basic_settings.start_isolde_at_startup = True
         from chimerax.core.commands import run
-        run(session, 'ui autostart %s ISOLDE' % ('true' if opt.value else 'false'))
-    autostart_opt = BooleanOption(
+        run(session, 'ui autostart false ISOLDE', log=False)
+    start_opt = BooleanOption(
         'Start ISOLDE at ChimeraX startup',
         basic_settings.start_isolde_at_startup,
-        _set_isolde_autostart,
+        None,                                   # persistence is automatic
         attr_name='start_isolde_at_startup',
         settings=basic_settings,
-        balloon='Open the ISOLDE panel automatically each time ChimeraX starts. '
-                'Equivalent to the "ui autostart true ISOLDE" command. Takes '
-                'effect at the next ChimeraX start.',
+        balloon='Open the ISOLDE panel automatically each time ChimeraX starts, '
+                'once any startup dialog (e.g. the ChimeraX registration '
+                'reminder) has been dealt with.',
     )
-    session.ui.main_window.add_settings_option('ISOLDE', autostart_opt)
+    session.ui.main_window.add_settings_option('ISOLDE', start_opt)
 
 basic_settings = None # set during bundle initialisation
 color_settings = None # set during bundle initialisation

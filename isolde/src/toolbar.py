@@ -147,7 +147,43 @@ class ToolbarButtonMgr:
         self._last_selected_rotamer = None
         session.triggers.add_handler('new frame', self._set_button_starting_states)
         session.triggers.add_handler('new frame', self._focus_isolde_tab_if_requested)
+        self._startup_frames = 0
+        session.triggers.add_handler('new frame', self._start_isolde_if_requested)
         self._initialize_callbacks()
+
+    # Number of frames to let pass before autostarting ISOLDE. ChimeraX's
+    # registration reminder is itself raised from a one-shot 'new frame' handler
+    # (chimerax.registration.nag), and whether that handler sits before or after
+    # ours depends on bundle initialisation order - so we can't rely on its modal
+    # dialog already being up on frame 1. Waiting a few frames means it always is
+    # by the time we look.
+    STARTUP_GRACE_FRAMES = 3
+
+    def _start_isolde_if_requested(self, *_):
+        # Honour Favourites > Settings > ISOLDE > "Start ISOLDE at ChimeraX
+        # startup". Deliberately NOT done via ChimeraX's own autostart list: that
+        # builds the tool during main-window construction, before any frame, so
+        # ISOLDE's always-on-top splash covers the registration reminder and
+        # swallows its clicks. Starting from here lets us wait for such dialogs.
+        from chimerax.core.triggerset import DEREGISTER
+        from .settings import basic_settings
+        if not getattr(basic_settings, 'start_isolde_at_startup', False):
+            return DEREGISTER
+        if hasattr(self.session, 'isolde'):
+            # Already running - the user may still have ISOLDE in ChimeraX's
+            # autostart list, or have started it by hand while we waited.
+            return DEREGISTER
+        self._startup_frames += 1
+        if self._startup_frames < self.STARTUP_GRACE_FRAMES:
+            return
+        from Qt.QtWidgets import QApplication
+        if QApplication.activeModalWidget() is not None:
+            # A modal dialog is up (registration reminder, session-restore
+            # warning, ...). Stay registered and look again next frame.
+            return
+        from chimerax.core.commands import run
+        run(self.session, 'isolde start')
+        return DEREGISTER
 
     def _focus_isolde_tab_if_requested(self, *_):
         # Honour Favourites > Settings > ISOLDE > "Show ISOLDE toolbar tab at
