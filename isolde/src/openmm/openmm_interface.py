@@ -3673,7 +3673,10 @@ def find_residue_templates(residues, forcefield, ligand_db = None, logger=None,
     cys_indices = set(cys_indices) - set(templates.keys())
     for c_i in cys_indices:
         r = residues[c_i]
-        rtype = cys_type(r)
+        # Pass the loaded template names so cys_type won't hand back MC_CYF (or any
+        # iron-sulfur type) unless its template is actually present -- otherwise the
+        # assignTemplates lookup below raises KeyError.
+        rtype = cys_type(r, template_names)
         if rtype is not None:
             templates[c_i] = rtype
             # Don't do this yet. Need to add code to clear the template name if the residue's atoms change
@@ -3777,10 +3780,36 @@ def find_residue_templates(residues, forcefield, ligand_db = None, logger=None,
         if template_name is not None:
             templates[residues.index(r)] = template_name
 
+    # Safety net: never hand back a template name the force field can't resolve.
+    # create_openmm_topology / assignTemplates look each name up directly in
+    # forcefield._templates, so a single unresolved entry raises a KeyError that
+    # aborts template assignment for the WHOLE model. Drop any such name -- the
+    # residue then falls through to normal topology matching -- and warn once,
+    # rather than take the whole model down over one stray entry (an MC_CYF whose
+    # iron-sulfur template isn't loaded, a metal_name_map / ligand-db name that
+    # failed to register, etc.).
+    known = forcefield._templates
+    for i, n in [(i, n) for i, n in templates.items() if n not in known]:
+        if logger is not None:
+            logger.warning(
+                'Template "{}" for residue {} is not present in the force field; '
+                'ignoring it and matching by topology instead.'.format(n, residues[i]))
+        del templates[i]
 
     return templates
 
-def cys_type(residue):
+def cys_type(residue, available_templates=None):
+    '''Best MD template name for a cysteine, deduced from its bonding.
+
+    `available_templates` (a container of the loaded template names, e.g.
+    ``forcefield._templates``) gates the dedicated iron-sulfur cysteine template
+    ``MC_CYF``: that template lives in the optional ``iron_sulfur.xml`` (disabled
+    in the default force field) or is generated per-site by
+    :func:`parameterise_metal_site`, so returning it when it is NOT loaded makes
+    ``assignTemplates`` raise ``KeyError: 'MC_CYF'`` and abort template assignment
+    for the whole model. When it is unavailable (or ``available_templates`` is
+    None, i.e. the caller isn't checking), an FES/SF4-bonded cysteine falls through
+    to the generic metal-binding handling below (-> ``CYM`` thiolate).'''
     from chimerax.atomic import Bonds, concatenate
     atoms = residue.atoms
     names = atoms.names
@@ -3790,8 +3819,9 @@ def cys_type(residue):
         return None
     for r in rneighbors:
         if r.name in ('SF4', 'FES'):
-            print('Found iron-sulfur cysteine')
-            return 'MC_CYF'
+            if available_templates is None or 'MC_CYF' in available_templates:
+                return 'MC_CYF'
+            break
     bonds = Bonds(sulfur_atom.bonds)
     if len(bonds) == 1:
         # Deprotonated
