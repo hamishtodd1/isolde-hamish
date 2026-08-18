@@ -1149,6 +1149,18 @@ def detect_metal_site(residues, max_heavy_atoms=250):
             if ((seed_coords - ac) ** 2).sum(axis=1).min() <= max_cut ** 2:
                 _add_metal(a)
 
+    # A polynuclear cluster (FES / SF4 / F3S ...) holds ALL its metals in ONE
+    # residue, but the search above, seeded from a single coordinating residue
+    # (e.g. one Cys), finds only the metal that residue directly binds -- giving a
+    # PARTIAL site: one Fe of a 2Fe-2S cluster, hence half its cysteines, whose
+    # wrong metal/core split then breaks the AM1-BCC build. Pull in every metal
+    # atom sharing a residue with a found metal, so the whole cluster (and thus all
+    # its donors) resolves no matter which coordinating residue seeded the search.
+    for a in list(metals):
+        for other in a.residue.atoms:
+            if other.element.is_metal:
+                _add_metal(other)
+
     if not metals:
         raise UserError(
             'Selected residue(s) contain no metal atom. For an ordinary organic '
