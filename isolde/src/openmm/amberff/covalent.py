@@ -249,12 +249,46 @@ def _parse_mol2_atoms(path):
 MAX_FRAGMENT_HEAVY = 30
 
 
+def _short_path(path):
+    '''The Windows 8.3 short-name form of `path` (which never contains spaces), or
+    `path` unchanged if it can't be shortened -- 8.3 generation disabled on the
+    volume, the path missing, or not on Windows. Used to space-proof AMBERHOME:
+    ANTECHAMBER builds its internal system() sub-tool commands from $AMBERHOME
+    WITHOUT quoting, so a space in the path (ChimeraX installs under a "Program
+    Files" directory) truncates the command at the first space and every sub-tool
+    invocation dies with "Cannot properly run C:/Program File". Safe no-op fallback:
+    a path that can't be shortened is returned as-is, i.e. no worse than before.'''
+    import sys
+    if sys.platform != 'win32' or not path:
+        return path
+    try:
+        import ctypes
+        from ctypes import wintypes
+        _get = ctypes.windll.kernel32.GetShortPathNameW
+        _get.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        _get.restype = wintypes.DWORD
+        buf = ctypes.create_unicode_buffer(1024)
+        n = _get(path, buf, 1024)
+        if 0 < n < 1024 and buf.value:
+            return buf.value
+    except Exception:
+        pass
+    return path
+
+
 def _amber_bin():
     '''Locate ChimeraX's bundled AMBER tools and set AMBERHOME (ANTECHAMBER shells
     out to bondtype/atomtype/sqm via system() and needs it, as chimerax.add_charge
-    does). Returns the bin directory.'''
+    does). Returns the bin directory.
+
+    On Windows both AMBERHOME and the returned bin are converted to their space-free
+    8.3 short-path form (see _short_path): ANTECHAMBER's unquoted internal system()
+    calls otherwise truncate an $AMBERHOME containing spaces -- and ChimeraX installs
+    under "C:/Program Files/..." -- so every sqm/atomtype sub-tool call fails.'''
     from chimerax.amber_info import amber_bin, amber_home
     import os
+    amber_home = _short_path(amber_home)
+    amber_bin = _short_path(amber_bin)
     os.environ['AMBERHOME'] = amber_home
     return amber_bin
 
