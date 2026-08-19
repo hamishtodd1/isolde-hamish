@@ -284,6 +284,11 @@ class UnparameterisedResiduesDialog(UI_Panel_Base):
         from chimerax.build_structure import modify_atom
         with busy_cursor(self.session, 'Adding hydrogens...'):
             run(self.session, f'addh #{residues.unique_structures[0].id_string}')
+            # addh also drops a backbone amide H whose position sits near a metal (it
+            # assumes coordination); an amide is never deprotonated, so restore those
+            # so metal-site residues match their force-field templates.
+            from chimerax.isolde.atomic.util import repair_backbone_amide_hydrogens
+            repair_backbone_amide_hydrogens(self.session, residues.unique_structures[0])
             # Occasionally addh adds only one hydrogen to a water (typically when it
             # is too close to a metal). Catch and fix to avoid user confusion.
             waters = residues[residues.names == 'HOH']

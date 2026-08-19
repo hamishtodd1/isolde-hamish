@@ -994,6 +994,12 @@ class Isolde():
             from chimerax.atomic import AtomicStructures
             from chimerax.addh import cmd
             cmd.cmd_addh(self.session, AtomicStructures([self.selected_model]), hbond=True)
+            # addh drops a backbone amide H whose position sits near a metal (it
+            # assumes coordination); an amide is never deprotonated, so restore it,
+            # otherwise a metal-site residue stays one atom short of its template and
+            # this very retry fails again.
+            from .atomic.util import repair_backbone_amide_hydrogens
+            repair_backbone_amide_hydrogens(self.session, self.selected_model)
             self._sim_end_cb(None, 'Adding hydrogens')
             self.selected_model.atoms.selected = False
             self._last_main_sel.selected = True

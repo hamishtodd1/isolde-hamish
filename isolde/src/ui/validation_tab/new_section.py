@@ -68,67 +68,6 @@ from matplotlib import colormaps
 
 _VIRIDIS = colormaps['viridis']
 
-
-def repair_backbone_amide_hydrogens(session, structure):
-    '''Re-add backbone amide hydrogens that ChimeraX's ``addh`` suppressed next to
-    a metal.
-
-    ``addh`` drops any hydrogen whose ideal position falls within ~2.7 A of a metal
-    with the parent-H vector pointing at it, on the assumption the parent atom
-    coordinates the metal -- correct for a titratable donor (a thiolate S, a
-    carboxylate O). A protein *backbone amide* nitrogen that merely sits near a
-    metal cluster is caught by the same purely-geometric test, yet an amide is
-    effectively never deprotonated (pKa ~ 17), so its H must be present. Without it
-    the residue is one atom short of its force-field template and fails to match --
-    e.g. a metal-site cysteine whose backbone happens to lie near the Fe-S cluster,
-    leaving the whole site's "Parameterise unit" row unresolved.
-
-    For every mid-chain, non-proline protein residue whose peptide N is fully
-    bonded (its previous-residue carbonyl C and its own CA) but carries no
-    hydrogen, add the single planar amide H. The coordinating side chain (e.g. a
-    thiolate SG that ``addh`` correctly left bare) is never touched, so the
-    protonation ``addh`` got right is preserved. Idempotent -- a residue that
-    already has its amide H is skipped. Returns the number of hydrogens added.
-    '''
-    from chimerax.atomic import Residue
-    from chimerax.build_structure import modify_atom
-    if structure is None or structure.deleted:
-        return 0
-    added = 0
-    for r in structure.residues:
-        if r.polymer_type != Residue.PT_AMINO or r.name == 'PRO':
-            continue
-        n = r.find_atom('N')
-        if n is None:
-            continue
-        if any(nb.element.number == 1 for nb in n.neighbors):
-            continue  # already carries its amide H
-        heavy = [nb for nb in n.neighbors if nb.element.number > 1]
-        # A plain mid-chain amide N has exactly two heavy neighbours: the previous
-        # residue's carbonyl C and its own CA. Anything else (a real N-terminus, a
-        # truncated residue) is left for addh to reason about.
-        has_prev_c = any(nb.residue is not r and nb.element.name == 'C' for nb in heavy)
-        has_ca = any(nb.name == 'CA' and nb.residue is r for nb in heavy)
-        if len(heavy) != 2 or not has_prev_c or not has_ca:
-            continue
-        try:
-            # connect_back=False: add a fresh H at the computed amide position rather
-            # than letting modify_atom bond it to whatever the H points toward -- the
-            # very metal/sulfide proximity that made addh drop it in the first place.
-            modify_atom(n, n.element, 3, connect_back=False)
-            added += 1
-        except Exception as e:
-            session.logger.info(
-                'ISOLDE: could not re-add backbone amide H to {}: {}'.format(r, e)
-            )
-    if added:
-        session.logger.info(
-            'ISOLDE: restored {} backbone amide hydrogen(s) that addh suppressed '
-            'near a metal'.format(added)
-        )
-    return added
-
-
 BOX_SIZE = 20  # px; row controls are BOX_SIZE squares, and it sets the box height
 # Suggestion boxes (candidate templates + the grey "no template" box) are half the
 # control width but full height, so more candidates fit per line while staying
@@ -980,6 +919,7 @@ class NewSectionDialog(UI_Panel_Base):
             try:
                 from chimerax.atomic import AtomicStructures
                 from chimerax.addh import cmd as addh_cmd
+                from chimerax.isolde.atomic.util import repair_backbone_amide_hydrogens
                 with busy_cursor(self.session, 'Adding hydrogens...'):
                     addh_cmd.cmd_addh(self.session, AtomicStructures([m]), hbond=True)
                     # addh leaves a backbone amide N bare when its H would sit near a
