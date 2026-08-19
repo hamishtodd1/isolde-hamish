@@ -24,21 +24,32 @@ does not touch the model. Interaction:
   * Hovering a box (>~2 frames, no button) previews it (grey) and flies the
     camera to the residue; leaving the box drops the preview. Red is unchanged.
   * Clicking a box moves the red box and rebuilds the residue to that template
-    (the grey box clears the override).
-  * Hovering the arrow flies the camera to the residue. Clicking it cycles the
-    grey preview to the next box (wrapping) and reveals a green "accept" tick to
-    its left: click the tick to commit the previewed box, or move the mouse off
-    the whole row to reject (both the preview and the tick then disappear).
+    (the grey box clears the override), and flies the camera to the residue --
+    underlining its name -- unless you are already looking at it.
+  * Clicking the arrow cycles the grey preview to the next box (wrapping) and
+    reveals a green "accept" tick to its left: click the tick to commit the
+    previewed box, or move the mouse off the whole row to reject (both the preview
+    and the tick then disappear). Cycling likewise flies to / underlines the
+    residue unless you are already there.
 
 Context-aware grouping: residues that fail template matching only because they
 are covalently modified are NOT shown one-by-one. They are clustered into the
 units the parameterisation pipeline builds -- a covalent unit (e.g. a drug + the
-cysteine it is bonded to), a metal coordination site, or a novel free ligand --
-and each unit is a single row with one "Parameterise unit" button that runs that
-pipeline (AM1-BCC) for the whole unit. This happens ONLY on the user's click; the
-simulation build never parameterises on its own. A residue that merely needs
-rebuilding to an EXISTING template still gets the candidate-box row described
-above.
+cysteine it is bonded to), a metal coordination site, or a novel free ligand.
+Scan parameterises the buildable metal sites and covalent units automatically
+(AM1-BCC) so they simply drop off the list; a unit that CANNOT be built here (an
+unsupported metal, an unresolved site, or too large for AM1-BCC) becomes a
+button-less info row stating why. A novel free ligand keeps a manual "Parameterise
+ligand" button (its build is never run unprompted), and a residue that merely
+needs rebuilding to an EXISTING template still gets the candidate-box row
+described above. The simulation build never parameterises on its own.
+
+Metal sites are kept listed at the BOTTOM of the panel even once built: a
+successfully-parameterised site is shown as a button-less "parameterised" row
+(re-detected by its loaded MMET_ template, so it never silently disappears after
+auto-build), while an unbuildable one shows its reason. The progressive populate
+adds every simpler (non-metal) residue first and only then starts on the metal
+sites.
 
 FMCS is computed lazily (only while the section is expanded) to keep the
 background populate cheap on large models.
@@ -654,6 +665,10 @@ class BoxRow(QWidget):
         self._set_armed(False)
         self._set_preview(None)
         self._commit(index)
+        # Changing the committed box flies to the residue (and _on_frame_drawn then
+        # underlines its name), unless you are already looking at it --
+        # _fly_to_residue no-ops the camera when the residue is already centred.
+        _fly_to_residue(self.residue)
 
     # --- arrow / accept --------------------------------------------------
     def arrow_clicked(self):
@@ -663,6 +678,10 @@ class BoxRow(QWidget):
             else self._preview_index
         self._set_armed(True)
         self._set_preview((start + 1) % len(self.boxes))
+        # Cycling the preview flies to the residue (and _on_frame_drawn underlines
+        # its name), unless you are already there -- _fly_to_residue no-ops the
+        # camera when the residue is already centred.
+        _fly_to_residue(self.residue)
 
     def accept_clicked(self):
         # Clicking the accept tick commits the previewed box.
@@ -707,13 +726,29 @@ class _NameScroll(QScrollArea):
             event.ignore()
 
 
+def _unit_note(descriptor):
+    '''Why a unit can't be parameterised in-app -- shown (muted) in place of the
+    button, and used to gate auto-parameterisation -- or None if it IS buildable.
+    An unsupported metal (no bundled LJ params, e.g. Mo), a metal site whose donors
+    could not be resolved (error), or too many heavy atoms for AM1-BCC.'''
+    note = descriptor.get('unsupported') or descriptor.get('error')
+    if note is None and descriptor.get('too_big'):
+        note = '{} heavy atoms -- too large for AM1-BCC; parameterise externally'.format(
+            descriptor.get('num_heavy_atoms', '?')
+        )
+    return note
+
+
 class ParameteriseRow(QWidget):
     '''Row for a unit that needs a *fresh* MD template built -- a covalent unit, a
-    metal site, or a novel free ligand with no existing template to rebuild to. A
-    single button runs the existing parameterisation pipeline (AM1-BCC) for the
-    whole unit. The button is disabled, with an explanatory note, when the unit
-    cannot be built here: too large for AM1-BCC, an unsupported metal (no bundled
-    LJ parameters, e.g. Mo), or a metal site whose donors could not be resolved.'''
+    metal site, or a novel free ligand with no existing template to rebuild to.
+    When the unit is buildable it shows a single button that runs the AM1-BCC
+    pipeline for the whole unit. When it CANNOT be built here (too large for
+    AM1-BCC, an unsupported metal e.g. Mo, or a metal site whose donors could not be
+    resolved) there is no button at all -- just a muted note stating why, so the
+    residue stays visible as a problem to handle externally. A descriptor flagged
+    ``parameterised`` (a metal site this panel already built, re-listed for
+    reference) shows a green "parameterised" tick and likewise no button.'''
 
     def __init__(self, descriptor, dialog=None, parent=None):
         super().__init__(parent)
@@ -722,26 +757,25 @@ class ParameteriseRow(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         hl = DefaultHLayout()
         kind = descriptor['kind']
-        btn = QPushButton('Parameterise ligand' if kind == 'free' else 'Parameterise unit')
-        # Reasons the unit can't be built here (button disabled + note shown):
-        # an unsupported metal, an unresolved metal site, or too large for AM1-BCC.
-        note = descriptor.get('unsupported') or descriptor.get('error')
-        if note is None and descriptor['too_big']:
-            note = (
-                '{} heavy atoms -- too large for AM1-BCC; parameterise externally'.format(
-                    descriptor['num_heavy_atoms']
-                )
-            )
-        if note is not None:
-            btn.setEnabled(False)
-            btn.setToolTip(_tooltip_html(note))
-        else:
+        note = _unit_note(descriptor)
+        if descriptor.get('parameterised'):
+            # Already built by this panel's pipeline -- listed for reference only, no
+            # action (per the user's choice). A green tick marks "done", distinct from
+            # the muted grey of a "can't build here" note.
+            lbl = QLabel('✓ parameterised')
+            lbl.setStyleSheet('color: #4caf50; font-style: italic;')
+            hl.addWidget(lbl)
+        elif note is None:
+            # Buildable: the actionable button. (Metal/covalent units are normally
+            # built automatically during Scan, so a button here is the manual path
+            # for a free ligand, or a retry for a unit whose auto-build raised.)
+            btn = QPushButton('Parameterise ligand' if kind == 'free' else 'Parameterise unit')
             btn.clicked.connect(self._clicked)
-        hl.addWidget(btn)
-        if note is not None:
+            hl.addWidget(btn)
+        else:
+            # Not buildable here -> no (greyed) button at all, just the reason.
             lbl = QLabel(note)
             lbl.setStyleSheet('color: #b0b0b0; font-style: italic;')
-            hl.addSpacing(6)
             hl.addWidget(lbl)
         hl.addStretch()
         self.setLayout(hl)
@@ -896,13 +930,17 @@ class NewSectionDialog(UI_Panel_Base):
         Clicking it adds hydrogens (matching needs them) then repopulates; it stays
         put so a re-click simply rescans. Appended to self.rows so the detected rows
         beneath it start on the next grid line (len(self.rows)).'''
-        btn = QPushButton('Scan for unparameterized residues  [will add hydrogens]')
+        btn = QPushButton(
+            'Scan for unparameterized residues  [adds hydrogens + builds metal/covalent sites]'
+        )
         btn.setStyleSheet('QPushButton { font-weight: bold; padding: 4px 10px; }')
         btn.setToolTip(
             _tooltip_html(
                 'Add hydrogens if needed (ISOLDE needs a fully protonated model, and '
-                'template matching counts hydrogens), then list the residues with no '
-                'matching MD template. Safe to click again to rescan.'
+                'template matching counts hydrogens), automatically parameterise the '
+                'buildable metal sites and covalent units (AM1-BCC), then list the '
+                'residues that still have no matching MD template. Safe to click '
+                'again to rescan.'
             )
         )
         btn.clicked.connect(lambda *_: self._scan())
@@ -933,8 +971,91 @@ class NewSectionDialog(UI_Panel_Base):
                         e.__class__.__name__, e
                     )
                 )
+            # Auto-run the metal/covalent unit builds that simply clear residues, so
+            # the user need not click each "Parameterise unit". Best-effort: any
+            # failure is logged and leaves that unit in the list. Guarded so a bug
+            # here can't block the scan/refresh below.
+            try:
+                self._auto_parameterise_units()
+            except Exception as e:
+                self.session.logger.warning(
+                    'New section: auto-parameterisation step failed ({}: {})'.format(
+                        e.__class__.__name__, e
+                    )
+                )
         with busy_cursor(self.session, 'Scanning for unparameterized residues...'):
             self._refresh()
+
+    @staticmethod
+    def _residue_set_key(residues):
+        '''Order-independent identity for a unit -- the set of its residues' (chain,
+        number, insertion code). Stable across the repeated re-detections in the Scan
+        loop, so it can dedupe a metal site and mark one as already-attempted.'''
+        return frozenset((r.chain_id, r.number, r.insertion_code) for r in residues)
+
+    def _auto_parameterise_units(self):
+        '''Automatically run the metal-site and covalent-unit builds that simply
+        clear their residues from the list -- the "just works, no decision" step the
+        user would otherwise trigger by hand -- so Scan resolves them in one go.
+        Free-ligand builds and template *choices* are left for the user. Only
+        buildable units are attempted (``_unit_note`` is None); an unsupported metal,
+        an unresolved site or a too-big unit is skipped and stays as an info row.
+
+        Loops detect -> build -> re-detect: a metal fan-out (one build parameterises
+        every copy of that site) then drops the siblings from the next detection
+        rather than rebuilding each, and a unit whose build raises is recorded and
+        not retried, so a persistent failure cannot spin the loop.'''
+        m = self.isolde.selected_model
+        if m is None or m.deleted:
+            return
+        attempted = set()
+        max_builds = 50  # backstop against a pathological non-converging loop
+
+        def unit_key(descriptor):
+            return self._residue_set_key(descriptor['residues'])
+
+        with busy_cursor(self.session, 'Auto-parameterising metal/covalent sites...'):
+            while not self._deleted:
+                if len(attempted) >= max_builds:
+                    self.session.logger.warning(
+                        'New section: auto-parameterisation stopped after {} builds '
+                        '(safety cap); click Scan again to continue.'.format(max_builds)
+                    )
+                    break
+                target = None
+                for entry in self._detect():
+                    if entry[0] != 'unit':
+                        continue
+                    descriptor = entry[1]
+                    if descriptor['kind'] not in ('metal', 'covalent'):
+                        continue
+                    if descriptor.get('parameterised'):
+                        continue  # already built and re-listed for reference -- skip
+                    if _unit_note(descriptor) is not None:
+                        continue  # unsupported / error / too big -> leave as info row
+                    key = unit_key(descriptor)
+                    if key in attempted:
+                        continue  # already tried and it didn't clear -- don't loop
+                    target = (descriptor, key)
+                    break
+                if target is None:
+                    break
+                descriptor, key = target
+                attempted.add(key)
+                label = self._unit_label(descriptor)
+                self.session.logger.status(
+                    'Auto-parameterising {} (AM1-BCC; may take a while)...'.format(label)
+                )
+                try:
+                    self._run_unit_pipeline(descriptor)
+                    self.session.logger.info('Parameterised {}.'.format(label))
+                except Exception as e:
+                    self.session.logger.warning(
+                        'New section: auto-parameterisation of {} failed '
+                        '({}: {})'.format(label, e.__class__.__name__, e)
+                    )
+                finally:
+                    self.session.logger.status('')
 
     def _process_next(self, gen):
         # Build one entry's row per event-loop turn (so each paints as it lands),
@@ -996,13 +1117,13 @@ class NewSectionDialog(UI_Panel_Base):
 
     def _add_parameterise_row(self, i, descriptor, label):
         '''A unit / novel free ligand row at grid row `i`: the residue label
-        followed by a "Parameterise unit/ligand" button (ParameteriseRow) that runs
-        the AM1-BCC pipeline for the whole unit on click (parameterise_unit). The
-        button disables itself with an explanatory note when the unit cannot be
-        built here -- an unsupported metal (no bundled LJ params, e.g. Mo), an
-        unresolved metal site, or too large for AM1-BCC. The ChemSearch edit button
-        targets the unit's seed. Appends to self.rows so the grid row counter
-        (len(self.rows)) stays right.'''
+        followed by a ParameteriseRow. For a buildable unit that is a "Parameterise
+        unit/ligand" button running the AM1-BCC pipeline on click
+        (parameterise_unit); for a unit that cannot be built here -- an unsupported
+        metal (no bundled LJ params, e.g. Mo), an unresolved metal site, or too
+        large for AM1-BCC -- there is no button, just a muted note saying why. The
+        ChemSearch edit button targets the unit's seed. Appends to self.rows so the
+        grid row counter (len(self.rows)) stays right.'''
         # Only a COVALENT unit seeds the whole unit into ChemSearch (a ligand + the
         # residue it is bonded to is one real molecule). Metal sites and free
         # ligands seed just their seed residue -- a multi-residue metal cluster has
@@ -1126,10 +1247,11 @@ class NewSectionDialog(UI_Panel_Base):
                 self._hide_replaced(row.residue)
                 # Make this residue the sole selection, so the preview's lifetime is
                 # tied to the selection (dropped by _on_selection_changed when the
-                # selection moves off it) rather than to the camera. The hover path
-                # also flies here; the arrow-cycle path does not, so selecting here
-                # covers both. Best-effort -- a preview with no selection just can't
-                # be given up by selection change (still replaced by another hover).
+                # selection moves off it) rather than to the camera. The hover and
+                # arrow-cycle paths also fly here (via _fly_to_residue), which selects
+                # too; doing it here as well covers any other caller. Best-effort -- a
+                # preview with no selection just can't be given up by selection change
+                # (still replaced by another hover).
                 if row.residue is not None and not row.residue.deleted:
                     _select_residue(row.residue)
 
@@ -1375,19 +1497,22 @@ class NewSectionDialog(UI_Panel_Base):
                 carbons.colors = self._model_carbon_color(residue)
             s.bonds.radii = PREVIEW_STICK_RADIUS
             s.bonds.halfbonds = True
-            # Make the preview's hydrogens mirror the MODEL's. The CCD ideal is the
-            # neutral, fully-protonated form and its H names rarely match the model's,
-            # so the carry-along above places template H by a translation that ignores
-            # the model's LOCAL orientation -- leaving some visibly wrong -- and shows
-            # acidic H the model lacks (deprotonated phosphates/carboxylates at ~pH 7).
-            # For each heavy atom shared with the model, pin its template hydrogens
-            # straight onto the model's own hydrogen coordinates (authoritative for
-            # the model), pairing by list order -- appearance only, so symmetric H
-            # (methyl/methylene) need no true matching -- and hide any template H
-            # beyond the model's count (the model leaves that position unprotonated;
-            # a hidden atom's bonds hide with it, so no stub is left behind). H on a
-            # template-only heavy atom (absent from the model) keep their carried
-            # geometry.
+            # Position the template's hydrogens at their IDEAL geometry, oriented to
+            # the PINNED heavy-atom skeleton -- do NOT copy the model's own H, which
+            # for a residue addh mis-protonated (e.g. an altloc THR whose CB H were
+            # skipped) are themselves at wrong angles. For each heavy atom shared with
+            # the model, superpose the template's local frame (that atom + its heavy
+            # neighbours, all already placed) onto the placed coordinates and move its
+            # template H by that rigid transform: a rigid move preserves the template's
+            # correct bond angles about the REAL (possibly distorted) atom. A terminal
+            # group with < 3 heavy anchors (methyl, hydroxyl) can't pin a full
+            # rotation; its carry-along position already holds the ideal angles about
+            # its own axis, so it is left as-is. Geometry aside, match the model's
+            # PROTONATION: hide any template H beyond the model's H count for that atom
+            # (a genuinely deprotonated site -- carboxylate/phosphate at ~pH 7 -- so
+            # the preview shows no acidic H the model lacks; a hidden atom's bonds hide
+            # with it, no stub remains). H on a template-only heavy atom (absent from
+            # the model) keep their carried geometry.
             try:
                 for th in s.atoms:
                     if th.element.number == 1:
@@ -1396,11 +1521,27 @@ class NewSectionDialog(UI_Panel_Base):
                     if model_heavy is None:
                         continue
                     t_hs = [nb for nb in th.neighbors if nb.element.number == 1]
-                    m_hs = [nb for nb in model_heavy.neighbors if nb.element.number == 1]
+                    if not t_hs:
+                        continue
+                    anchors = [th] + [
+                        nb for nb in th.neighbors
+                        if nb.element.number > 1 and index_by_atom[nb] in placed
+                    ]
+                    if len(anchors) >= 3:
+                        ai = [index_by_atom[a] for a in anchors]
+                        lp, _ = align_points(
+                            numpy.array([rigid[j] for j in ai]),
+                            numpy.array([coords[j] for j in ai])
+                        )
+                        hi = [index_by_atom[h] for h in t_hs]
+                        newpos = lp.transform_points(numpy.array([rigid[j] for j in hi]))
+                        for h, p in zip(t_hs, newpos):
+                            h.coord = p
+                    n_model_h = len(
+                        [nb for nb in model_heavy.neighbors if nb.element.number == 1]
+                    )
                     for k, h in enumerate(t_hs):
-                        if k < len(m_hs):
-                            h.coord = m_hs[k].coord
-                        else:
+                        if k >= n_model_h:
                             h.display = False
             except Exception:
                 pass
@@ -1575,25 +1716,13 @@ class NewSectionDialog(UI_Panel_Base):
         seed = descriptor['seed']
         if seed is None or seed.deleted:
             return
-        kind = descriptor['kind']
-        unit = descriptor['unit']
         label = self._unit_label(descriptor)
         self.session.logger.status(
             'Parameterising {} (running AM1-BCC; this may take a while)...'.format(label)
         )
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            from chimerax.isolde.openmm.amberff.covalent import (
-                parameterise_metal_site,
-                parameterise_covalent_unit,
-                parameterise_free_ligand,
-            )
-            if kind == 'metal':
-                parameterise_metal_site(self.session, unit)
-            elif kind == 'covalent':
-                parameterise_covalent_unit(self.session, unit)
-            else:
-                parameterise_free_ligand(self.session, seed)
+            self._run_unit_pipeline(descriptor)
         except Exception as e:
             self.session.logger.warning(
                 'New section: parameterisation of {} failed ({}: {})'.format(
@@ -1604,6 +1733,25 @@ class NewSectionDialog(UI_Panel_Base):
             QApplication.restoreOverrideCursor()
             self.session.logger.status('')
         self._refresh()
+
+    def _run_unit_pipeline(self, descriptor):
+        '''Dispatch a unit descriptor to the matching AM1-BCC pipeline (metal site /
+        covalent unit / free ligand). No cursor, status or refresh of its own -- the
+        caller owns those -- so it can be driven both by the manual button
+        (parameterise_unit) and by the automatic Scan loop
+        (_auto_parameterise_units).'''
+        from chimerax.isolde.openmm.amberff.covalent import (
+            parameterise_metal_site,
+            parameterise_covalent_unit,
+            parameterise_free_ligand,
+        )
+        kind = descriptor['kind']
+        if kind == 'metal':
+            parameterise_metal_site(self.session, descriptor['unit'])
+        elif kind == 'covalent':
+            parameterise_covalent_unit(self.session, descriptor['unit'])
+        else:
+            parameterise_free_ligand(self.session, descriptor['seed'])
 
     def open_in_chemsearch(self, residue, unit_residues=None):
         '''Open a structure in the ChimeraX-ChemSearch 2D editor. Normally seeds the
@@ -2041,21 +2189,25 @@ class NewSectionDialog(UI_Panel_Base):
         for r, tinfo in ambiguous.items():
             payload_by_residue[residues[r.index]] = ('ambiguous', tinfo)
         offenders = list(payload_by_residue.keys())
-        if not offenders:
-            return []
         # Context-aware grouping: cluster the isolated failures into the units the
         # pipeline actually builds (metal site / covalent unit / free ligand), so a
         # covalent ligand + its partner residue is ONE entry rather than several.
-        # Cheap (graph/geometry only); no model mutation.
-        try:
-            from chimerax.isolde.openmm.amberff.covalent import (group_for_parameterisation)
-            groups = group_for_parameterisation(self.session, offenders, forcefield=ff)
-        except Exception as e:
-            self.session.logger.info(
-                'New section: could not group unparameterised residues; falling '
-                'back to per-residue ({}: {})'.format(e.__class__.__name__, e)
-            )
-            return [('residue', r, k, p, None) for r, (k, p) in payload_by_residue.items()]
+        # Cheap (graph/geometry only); no model mutation. Skipped when there are no
+        # offenders -- but detection continues, so an already-built metal site is
+        # still re-listed below rather than the panel collapsing to nothing.
+        groups = []
+        if offenders:
+            try:
+                from chimerax.isolde.openmm.amberff.covalent import (
+                    group_for_parameterisation
+                )
+                groups = group_for_parameterisation(self.session, offenders, forcefield=ff)
+            except Exception as e:
+                self.session.logger.info(
+                    'New section: could not group unparameterised residues; falling '
+                    'back to per-residue ({}: {})'.format(e.__class__.__name__, e)
+                )
+                return [('residue', r, k, p, None) for r, (k, p) in payload_by_residue.items()]
         entries = []
         for g in groups:
             if g['kind'] in ('metal', 'covalent'):
@@ -2064,6 +2216,66 @@ class NewSectionDialog(UI_Panel_Base):
                 r = g['seed']
                 kind, payload = payload_by_residue.get(r, ('unmatched', None))
                 entries.append(('residue', r, kind, payload, g))
+        # Metal sites this panel already BUILT (an MMET_<name> template is loaded) are
+        # no longer offenders, so the grouping above misses them. Re-list them
+        # (info-only, "parameterised") so a built site does not silently vanish -- the
+        # user asked for metal sites to stay visible once done. Dedupe against any
+        # metal site still present above as an offender.
+        metal_seen = set(
+            self._residue_set_key(e[1]['residues']) for e in entries
+            if e[0] == 'unit' and e[1].get('kind') == 'metal'
+        )
+        entries += self._detect_parameterised_metal_sites(m, ff, metal_seen)
+        # Metal sites sink to the BOTTOM: emit every non-metal ("simpler") row first,
+        # then the metal-site rows, so the progressive populate reaches the simple
+        # ones before it starts on any metal site.
+        metal = [e for e in entries if e[0] == 'unit' and e[1].get('kind') == 'metal']
+        non_metal = [
+            e for e in entries if not (e[0] == 'unit' and e[1].get('kind') == 'metal')
+        ]
+        return non_metal + metal
+
+    def _detect_parameterised_metal_sites(self, model, ff, exclude_keys):
+        '''Non-standard metal sites this panel has already parameterised: a metal-
+        containing residue whose ``MMET_<name>`` template is loaded in ``ff`` (exactly
+        what parameterise_metal_site emits and name-matches). These are no longer
+        offenders, so _detect's grouping misses them; return them as info-only
+        'parameterised' unit entries (rendered button-less by ParameteriseRow) so a
+        built site stays listed. Deduped against ``exclude_keys`` (metal sites already
+        listed as offenders). Read-only and best-effort -- a site that no longer
+        resolves (donors moved, residue deleted) is simply skipped.'''
+        from chimerax.isolde.openmm.amberff.covalent import detect_metal_site
+        known = ff._templates
+        entries = []
+        seen = set(exclude_keys)
+        for r in model.residues:
+            if r.deleted or ('MMET_' + r.name) not in known:
+                continue
+            if not any(a.element.is_metal for a in r.atoms):
+                continue
+            try:
+                site = detect_metal_site(r)
+            except Exception:
+                continue
+            key = self._residue_set_key(site.residues)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(
+                (
+                    'unit', {
+                        'kind': 'metal',
+                        'seed': r,
+                        'unit': site,
+                        'residues': list(site.residues),
+                        'too_big': False,
+                        'unsupported': None,
+                        'error': None,
+                        'num_heavy_atoms': site.num_heavy_atoms,
+                        'parameterised': True,
+                    }
+                )
+            )
         return entries
 
     def _candidates_for(self, kind, payload, residue):
