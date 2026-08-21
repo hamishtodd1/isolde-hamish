@@ -1806,7 +1806,10 @@ class NewSectionDialog(UI_Panel_Base):
             # target. The sign is a label child of the preview structure, so it lives
             # and dies with the preview.
             if ccd_name and ccd_name != residue.name:
-                self._add_rename_sign(s, tmpl_res, ccd_name)
+                self._add_rename_sign(
+                    s, tmpl_res, residue.name, ccd_name,
+                    self._model_carbon_color(residue)
+                )
             return s
         except Exception as e:
             # Cache the failure so it isn't retried/re-logged on every hover, and
@@ -1820,26 +1823,46 @@ class NewSectionDialog(UI_Panel_Base):
             )
             return None
 
-    def _add_rename_sign(self, structure, residue, new_name):
-        '''Put a small "will cause rename" sign on the model at the previewed
-        residue, so the user sees up front that accepting this template changes the
-        residue type (e.g. THR -> SER). Rendered as a 3D billboard label attached to
+    def _add_rename_sign(self, structure, residue, old_name, new_name, color):
+        '''Put a small "⚠ <old> → <new>" sign on the model at the previewed residue,
+        so the user sees up front that accepting this template changes the residue
+        type (e.g. THR -> SER). Rendered as a 3D billboard label attached to
         `residue` (a residue of the PREVIEW `structure`), so ChimeraX keeps it a
         child "labels" model of that structure -- it therefore appears and disappears
-        with the preview, needing no separate teardown. Best-effort: if the label
-        bundle is unavailable (e.g. no windowing system) it is simply skipped.'''
+        with the preview, needing no separate teardown. `color` (the model's carbon
+        colour, an RGBA uint8) tints both the text and a rectangular OUTLINE around
+        the box, so the sign reads as framed and matches the preview's carbon sticks.
+
+        The label command has no border option, so after it creates and positions the
+        label we render the box ourselves with an outline (text_image_rgba's
+        outline_width) and swap it in as the label's custom image. Best-effort: if the
+        label bundle is unavailable (no windowing system) the sign is skipped; if the
+        custom-image swap can't find the label model the sign just shows unbordered.'''
         try:
             from chimerax.core.objects import Objects
-            from chimerax.label.label3d import label as label3d
+            from chimerax.label.label3d import label as label3d, labels_model
+            col = tuple(int(v) for v in color)      # model carbon colour (RGBA)
+            bg = (30, 30, 30, 200)                  # dark plate for legibility
+            text = '⚠ {} → {}'.format(old_name, new_name)
             objs = Objects()
             objs.add_atoms(residue.atoms)
             label3d(
                 self.session, objects=objs, object_type='residues',
-                text='will cause rename → {}'.format(new_name),
-                color=(255, 190, 60, 255),      # warning amber
-                bg_color=(30, 30, 30, 200),     # dark plate for legibility
+                text=text, color=col, bg_color=bg,
                 height=0.6, offset=(0, 1.6, 0.5), on_top=True,
             )
+            # Re-render the box with a carbon-coloured outline and swap it in.
+            lm = labels_model(structure)
+            if lm is not None:
+                from chimerax.graphics import text_image_rgba
+                size = 48  # label default point size (matches the label just made)
+                img = text_image_rgba(
+                    text, col, size, 'Arial', background_color=bg,
+                    xpad=int(0.2 * size), outline_width=2, outline_color=col,
+                )
+                for lo in getattr(lm, '_labels', []):
+                    lo.custom_image = img
+                lm.update_labels()
         except Exception:
             pass
 
