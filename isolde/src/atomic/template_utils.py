@@ -358,6 +358,48 @@ def _place_rigid_blocks(residue, template, missing):
     return set(missing) - placed
 
 
+def _reidealise_hydrogens(residue):
+    '''Move each hydrogen onto the ideal position implied by its parent heavy atom's
+    ACTUAL bonded skeleton -- INCLUDING bonds to neighbouring residues -- without
+    moving any heavy atom.
+
+    The template-based internal-coordinate builder anchors a rebuilt H only on
+    *template* atoms, so an H whose geometry is set by an EXTERNAL (inter-residue)
+    bond is placed wrongly -- above all the backbone amide H, whose plane is fixed
+    by the previous residue's carbonyl, which the template does not contain. It
+    lands ~40 deg off, which reads as "terrible hydrogens" and makes the residue
+    look like a disconnected free monomer. Deriving each H from ``bond_positions``
+    on the parent's real neighbour coordinates fixes that and is chain-aware by
+    construction (the amide H comes out planar with the peptide bond). Heavy atoms
+    and hydrogen identities/names are untouched, and the H count per parent is
+    preserved (a deprotonated site stays bare).'''
+    from chimerax.atomic.bond_geom import bond_positions
+    from chimerax.atomic.idatm import type_info
+    from chimerax.atomic import Element
+    from chimerax.build_structure.mod import bond_length
+    hyd = Element.get_element('H')
+    for p in [a for a in residue.atoms if a.element.number > 1]:
+        hs = [nb for nb in p.neighbors if nb.element.number == 1]
+        if not hs:
+            continue
+        heavy = [nb for nb in p.neighbors if nb.element.number > 1]
+        try:
+            geom = type_info[p.idatm_type].geometry
+        except Exception:
+            continue
+        # Only re-place when the parent's coordination geometry can host every bond;
+        # otherwise leave the H as the builder placed them.
+        if geom < len(heavy) + len(hs):
+            continue
+        try:
+            hlen = bond_length(p, geom, hyd)
+            positions = bond_positions(p.coord, geom, hlen, [nb.coord for nb in heavy])
+        except Exception:
+            continue
+        for h, pos in zip(hs, positions[:len(hs)]):
+            h.coord = pos
+
+
 def fix_residue_from_template(residue, template, rename_atoms_only=False,
         rename_residue=False, match_by='name', template_indices=None,
         optimise_torsions=True):
@@ -498,6 +540,11 @@ def fix_residue_from_template(residue, template, rename_atoms_only=False,
         except Exception as e:
             session.logger.info(
                 f'Pendant-torsion optimisation skipped for {residue.name}: {e}')
+    # The block/internal-coordinate builders above anchor rebuilt H on template
+    # atoms only, so any H fixed by an external (inter-residue) bond -- most of all
+    # the backbone amide H -- lands wrongly. Re-place every H off the residue's real
+    # bonded skeleton; heavy atoms do not move.
+    _reidealise_hydrogens(residue)
     if rename_residue:
         residue.name = template.name
     return corrected, unfixable
@@ -860,6 +907,9 @@ def fix_residue_to_match_md_template(session, residue, md_template, cif_template
     residue_indices = residue.atoms.indices(ratoms)
     #template_extra_atoms = [md_template.atoms[i] for i in template_extra_indices]
     add_missing_md_template_atoms(session, residue, md_template, residue_indices, template_indices)
+    # add_missing_md_template_atoms may (re)build H via modify_atom off the template
+    # alone; re-idealise every H against the real (chain-connected) skeleton.
+    _reidealise_hydrogens(residue)
 
 def add_missing_md_template_atoms(session, residue, md_template, residue_indices, template_indices):
     import numpy
@@ -962,6 +1012,7 @@ def trim_residue_to_md_template(residue, md_template):
         rgraph = make_graph_from_residue(residue)
         ri, ti, _ = rgraph.maximum_common_subgraph(md_template.graph, big_first=True, timeout=5)
         add_missing_md_template_atoms(residue.session, residue, md_template, ri, ti)
+        _reidealise_hydrogens(residue)
     else:
         raise UserError(err_string)
 
