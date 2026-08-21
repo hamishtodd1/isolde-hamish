@@ -788,7 +788,7 @@ class ParameteriseRow(QWidget):
 class NewSectionPanel(CollapsibleArea):
 
     def __init__(self, session, isolde, parent, gui, **kwargs):
-        super().__init__(gui, parent, title="New section", **kwargs)
+        super().__init__(gui, parent, title="Unparameterized Components", **kwargs)
         cd = self.content = NewSectionDialog(session, isolde, gui, self)
         self.setContentLayout(cd.main_layout)
 
