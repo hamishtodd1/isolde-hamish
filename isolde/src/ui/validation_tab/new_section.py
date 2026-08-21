@@ -1696,6 +1696,22 @@ class NewSectionDialog(UI_Panel_Base):
             from chimerax.isolde.atomic.template_utils import fix_residue_to_match_md_template
             fix_residue_to_match_md_template(self.session, residue, template, cif_template=ccd)
             residue.isolde_template_name = template_name
+            # If the accepted template is a DIFFERENT residue type (e.g. SER applied
+            # to a THR), rename the model residue so it reflects the change -- the
+            # rebuild has already swapped its atoms to match. The target is the CCD
+            # component id without its variant suffix (SER_LL -> SER); fall back to
+            # the MD template name if no CCD reference resolved.
+            new_name = ccd.name.split('_')[0] if ccd is not None else template_name
+            if new_name and new_name != residue.name:
+                old_name = residue.name
+                residue.name = new_name
+                self.session.logger.info(
+                    'New section: renamed /{}:{}{} {} to {} to match the applied '
+                    'template.'.format(
+                        residue.chain_id, residue.number, residue.insertion_code, old_name,
+                        new_name
+                    )
+                )
         except Exception as e:
             self.session.logger.warning(
                 'New section: could not rebuild /{}{}{} to template "{}" ({}: {})'.format(
@@ -2302,6 +2318,9 @@ class NewSectionDialog(UI_Panel_Base):
         name_cands, comp_cands = self._filter_by_linkage(
             name_cands, comp_cands, self._residue_link_count(residue)
         )
+        name_cands, comp_cands = self._filter_by_terminal_protonation(
+            name_cands, comp_cands, residue
+        )
         return self._dedup_functional_duplicates(name_cands, comp_cands)
 
     def _candidates(self, template_names, kind, res_mol):
@@ -2318,12 +2337,24 @@ class NewSectionDialog(UI_Panel_Base):
         from .unparameterised import _get_ccd_template_and_name
         ccd, description = _get_ccd_template_and_name(self.session, tname)
         ccd_name = ccd.name if ccd is not None else 'Not found'
+        # Terminal protonation of the CCD geometry template, read by
+        # _filter_by_terminal_protonation to reject a free/zwitterionic form (a
+        # backbone N as -NH3+, or a free -OXT) for a residue whose matching terminus
+        # is actually peptide-bonded.
+        n_terminal_h, has_oxt = 0, False
+        if ccd is not None:
+            n_atom = ccd.find_atom('N')
+            if n_atom is not None:
+                n_terminal_h = sum(1 for nb in n_atom.neighbors if nb.element.number == 1)
+            has_oxt = ccd.find_atom('OXT') is not None
         return {
             'template_name': tname,
             'fraction': frac,
             'fill': _fraction_to_viridis_css(frac),
             'tooltip': _match_tooltip(kind, tname, frac, ccd_name, description),
             'signature': self._template_signature(tname),
+            'n_terminal_h': n_terminal_h,
+            'has_oxt': has_oxt,
         }
 
     def _template_signature(self, tname):
@@ -2437,6 +2468,41 @@ class NewSectionDialog(UI_Panel_Base):
 
         fname = [c for c in name_cands if compatible(c)]
         fcomp = [c for c in comp_cands if compatible(c)]
+        if not fname and not fcomp:
+            return name_cands, comp_cands
+        return fname, fcomp
+
+    def _filter_by_terminal_protonation(self, name_cands, comp_cands, residue):
+        '''Drop candidates whose terminal protonation contradicts the residue's
+        actual chain linkage: a free/zwitterionic form (a backbone N as -NH3+, or a
+        free -OXT carboxylate) is wrong for a terminus that is peptide-bonded to a
+        neighbour. This catches an isolated-residue template that still declares
+        external bonds -- the zwitterionic ZS/ZT slip past the external-bond COUNT
+        check in _filter_by_linkage, preview cleanly (the preview hides leaving
+        atoms), then on commit rebuild a mid-chain residue as a free amino acid
+        (three N-H at the peptide bond plus an OXT). Per-terminus, so an N-linked /
+        C-free residue still keeps its OXT form. As elsewhere, if the filter would
+        drop everything the lists are returned unfiltered.'''
+        n_atom = residue.find_atom('N')
+        c_atom = residue.find_atom('C')
+        n_linked = n_atom is not None and any(
+            nb.residue is not residue and nb.element.name == 'C' for nb in n_atom.neighbors
+        )
+        c_linked = c_atom is not None and any(
+            nb.residue is not residue and nb.element.name == 'N' for nb in c_atom.neighbors
+        )
+        if not n_linked and not c_linked:
+            return name_cands, comp_cands  # a free monomer: any protonation is fair
+
+        def ok(c):
+            if n_linked and c.get('n_terminal_h', 0) > 1:
+                return False  # -NH3+ on a chain-linked N
+            if c_linked and c.get('has_oxt', False):
+                return False  # free -OXT on a chain-linked C
+            return True
+
+        fname = [c for c in name_cands if ok(c)]
+        fcomp = [c for c in comp_cands if ok(c)]
         if not fname and not fcomp:
             return name_cands, comp_cands
         return fname, fcomp
