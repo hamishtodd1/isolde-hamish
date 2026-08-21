@@ -27,7 +27,7 @@ does not touch the model. Interaction:
     (the grey box clears the override), and flies the camera to the residue --
     underlining its name -- unless you are already looking at it.
   * Clicking the arrow cycles the grey preview to the next box (wrapping) and
-    reveals a green "accept" tick to its left: click the tick to commit the
+    reveals a green "accept" tick to its right: click the tick to commit the
     previewed box, or move the mouse off the whole row to reject (both the preview
     and the tick then disappear). Cycling likewise flies to / underlines the
     residue unless you are already there.
@@ -36,20 +36,30 @@ Context-aware grouping: residues that fail template matching only because they
 are covalently modified are NOT shown one-by-one. They are clustered into the
 units the parameterisation pipeline builds -- a covalent unit (e.g. a drug + the
 cysteine it is bonded to), a metal coordination site, or a novel free ligand.
-Scan parameterises the buildable metal sites and covalent units automatically
-(AM1-BCC) so they simply drop off the list; a unit that CANNOT be built here (an
-unsupported metal, an unresolved site, or too large for AM1-BCC) becomes a
-button-less info row stating why. A novel free ligand keeps a manual "Parameterise
-ligand" button (its build is never run unprompted), and a residue that merely
-needs rebuilding to an EXISTING template still gets the candidate-box row
-described above. The simulation build never parameterises on its own.
+Nothing is parameterised automatically and nothing is removed from the list on
+its own: each buildable unit carries a "Parameterise unit" (or "Parameterise
+ligand") button that runs AM1-BCC ONLY on an explicit click, and on success the
+button flips to a green tick IN PLACE -- the unit stays listed. A unit that
+CANNOT be built here (an unsupported metal, an unresolved site, or too large for
+AM1-BCC) is a button-less info row stating why. A residue that merely needs
+rebuilding to an EXISTING template still gets the candidate-box row described
+above. The simulation build never parameterises on its own.
 
-Metal sites are kept listed at the BOTTOM of the panel even once built: a
-successfully-parameterised site is shown as a button-less "parameterised" row
-(re-detected by its loaded MMET_ template, so it never silently disappears after
-auto-build), while an unbuildable one shows its reason. The progressive populate
-adds every simpler (non-metal) residue first and only then starts on the metal
-sites.
+Identical metal sites are grouped: one build of a metalloligand fans out by
+residue name to every copy in the model (parameterise_metal_site), so all copies
+sharing an MMET_<name> template are shown as a stack of per-site lines beside a
+SINGLE shared button that spans them -- one click builds them all.
+
+Metal sites sink to the BOTTOM of the panel and stay listed even once built: a
+parameterised site shows a button-less green "parameterised" tick (re-detected by
+its loaded MMET_ template on a rescan, so it never silently disappears), while an
+unbuildable one shows its reason. The progressive populate adds every simpler
+(non-metal) residue first and only then starts on the metal sites.
+
+The section sits at the bottom of the Validate tab (itself a vertical scroll
+area), so the row list grows DOWNWARD to fit its content -- into whatever space
+is free below the collapsed panels above it -- rather than being boxed into a few
+internally-scrolling rows; the tab's own outer scroll handles any overflow.
 
 FMCS is computed lazily (only while the section is expanded) to keep the
 background populate cheap on large models.
@@ -80,17 +90,16 @@ from matplotlib import colormaps
 _VIRIDIS = colormaps['viridis']
 
 BOX_SIZE = 20  # px; row controls are BOX_SIZE squares, and it sets the box height
-# Suggestion boxes (candidate templates + the grey "no template" box) are half the
-# control width but full height, so more candidates fit per line while staying
-# aligned with -- and not shrinking -- the arrow/accept/edit buttons.
-BOX_WIDTH = BOX_SIZE // 2
-# Gap between the three box groups (no-template | name-match | topology-match).
-# Within a group boxes are contiguous (row spacing 0); the gap only sits between
-# groups. It no longer causes hover flicker -- crossing it stays inside the row,
-# whose leaveEvent is what clears the preview (see BoxRow.leaveEvent).
-GROUP_GAP = 14  # px
-# Show roughly this many rows before the vertical scrollbar kicks in.
-VISIBLE_ROWS = 8
+# Suggestion boxes (candidate templates + the grey "no template" box) are SQUARE --
+# same width as height -- so they read as tiles, and match the arrow/accept/edit
+# buttons in size.
+BOX_WIDTH = BOX_SIZE
+# Gap between the three box groups (no-template | name-match | topology-match). One
+# box wide, so the sections are separated by a space as wide as the boxes
+# themselves. Within a group boxes are contiguous (row spacing 0); the gap only
+# sits between groups. It no longer causes hover flicker -- crossing it stays inside
+# the row, whose leaveEvent is what clears the preview (see BoxRow.leaveEvent).
+GROUP_GAP = BOX_WIDTH  # px (= one box width)
 # Gap (px) between the fixed-width name cell and the cycle arrow, within the single
 # left-packed row that each entry is now composed into (see _compose_row).
 GAP_AFTER_NAME = 6
@@ -443,7 +452,7 @@ class SelectableBox(QFrame):
 
 class ArrowButton(QToolButton):
     '''The per-row "cycle" button: clicking advances the grey preview to the next
-    box (wrapping) and reveals the accept button (green tick) to its left. Hovering
+    box (wrapping) and reveals the accept button (green tick) to its right. Hovering
     does nothing (no camera fly).'''
 
     def __init__(self, row, parent=None):
@@ -459,7 +468,7 @@ class ArrowButton(QToolButton):
 
 
 class AcceptButton(QPushButton):
-    '''Appears to the LEFT of the arrow once the arrow is clicked: a green tick
+    '''Appears to the RIGHT of the arrow once the arrow is clicked: a green tick
     that commits the previewed template. Hidden otherwise, but keeps its layout
     slot (retainSizeWhenHidden) so the row never shifts when it appears/hides.'''
 
@@ -553,10 +562,10 @@ class ResidueNameLabel(QLabel):
 
 
 class BoxRow(QWidget):
-    '''One residue's row: an accept button (hidden until the arrow is clicked),
-    the cycle arrow, the grey "no template" box, then the viridis template boxes.
-    Owns the committed (red) and preview (grey) indices and drives the dialog's
-    preview / commit for this residue.'''
+    '''One residue's row: the cycle arrow, an accept button (hidden until the arrow
+    is clicked), the grey "no template" box, then the viridis template boxes. Owns
+    the committed (red) and preview (grey) indices and drives the dialog's preview /
+    commit for this residue.'''
 
     def __init__(self, name_cands, comp_cands, residue=None, dialog=None, parent=None):
         super().__init__(parent)
@@ -567,12 +576,12 @@ class BoxRow(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         hl = DefaultHLayout()
         hl.setSpacing(0)  # contiguous boxes -> no dead pixels to flicker over
-        # Accept button (green tick) to the LEFT of the arrow -- hidden until the
+        # Cycle arrow first (leftmost).
+        hl.addWidget(ArrowButton(self))
+        # Accept button (green tick) to the RIGHT of the arrow -- hidden until the
         # arrow is clicked, but keeps its slot so the row never shifts.
         self._accept_btn = AcceptButton(self)
         hl.addWidget(self._accept_btn)
-        # Cycle arrow, between the accept button and the first (grey) box.
-        hl.addWidget(ArrowButton(self))
         self.boxes = []
         idx = 0
         # Far-left grey "no imposed template" box (committed by default).
@@ -740,49 +749,110 @@ def _unit_note(descriptor):
 
 
 class ParameteriseRow(QWidget):
-    '''Row for a unit that needs a *fresh* MD template built -- a covalent unit, a
-    metal site, or a novel free ligand with no existing template to rebuild to.
-    When the unit is buildable it shows a single button that runs the AM1-BCC
-    pipeline for the whole unit. When it CANNOT be built here (too large for
-    AM1-BCC, an unsupported metal e.g. Mo, or a metal site whose donors could not be
-    resolved) there is no button at all -- just a muted note stating why, so the
-    residue stays visible as a problem to handle externally. A descriptor flagged
-    ``parameterised`` (a metal site this panel already built, re-listed for
-    reference) shows a green "parameterised" tick and likewise no button.'''
+    '''The action for a unit that needs a *fresh* MD template built -- a covalent
+    unit, a metal site, or a novel free ligand with no existing template to rebuild
+    to. When the unit is buildable it shows a single button that runs the AM1-BCC
+    pipeline ONLY on an explicit click; on success the button flips to a green tick
+    IN PLACE (mark_parameterised), so the unit stays listed rather than being
+    removed. When it CANNOT be built here (too large for AM1-BCC, an unsupported
+    metal e.g. Mo, or a metal site whose donors could not be resolved) there is no
+    button at all -- just a muted note stating why, so the residue stays visible as
+    a problem to handle externally. A descriptor flagged ``parameterised`` (a metal
+    site re-detected from its loaded template on a rescan) shows the green tick and
+    likewise no button.
 
-    def __init__(self, descriptor, dialog=None, parent=None):
+    ``cluster`` (a list of >1 metal-site descriptors) makes this the ONE shared
+    button for a group of identical metal sites -- one build fans out by residue
+    name to every copy -- and the button grows to span the stacked per-site lines
+    beside it, with multi-line "Parameterise / N sites" text.'''
+
+    def __init__(self, descriptor, dialog=None, cluster=None, parent=None):
         super().__init__(parent)
         self._descriptor = descriptor
         self._dialog = dialog
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        # A list of >1 descriptors => this is the shared button for that many
+        # identical metal sites (one build handles all); else a single unit.
+        self._cluster = cluster
+        # Optional callback invoked by mark_parameterised INSTEAD of the default
+        # single-tick flip -- set for a cluster button so success puts a ✓ next to
+        # every member line, not one tick for the whole group (see
+        # _add_unit_cluster_row).
+        self._on_parameterised = None
+        span = cluster is not None and len(cluster) > 1
+        self.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Expanding if span else QSizePolicy.Policy.Fixed
+        )
         hl = DefaultHLayout()
         kind = descriptor['kind']
         note = _unit_note(descriptor)
         if descriptor.get('parameterised'):
-            # Already built by this panel's pipeline -- listed for reference only, no
-            # action (per the user's choice). A green tick marks "done", distinct from
-            # the muted grey of a "can't build here" note.
-            lbl = QLabel('✓ parameterised')
-            lbl.setStyleSheet('color: #4caf50; font-style: italic;')
-            hl.addWidget(lbl)
+            # Already built -- listed for reference only, no action. A green tick
+            # marks "done", distinct from the muted grey of a "can't build here" note.
+            self._add_done_label(hl)
         elif note is None:
-            # Buildable: the actionable button. (Metal/covalent units are normally
-            # built automatically during Scan, so a button here is the manual path
-            # for a free ligand, or a retry for a unit whose auto-build raised.)
-            btn = QPushButton('Parameterise ligand' if kind == 'free' else 'Parameterise unit')
+            # Buildable: the actionable button, run ONLY on an explicit click.
+            if span:
+                n = len(cluster)
+                btn = QPushButton('Parameterise\n%d sites' % n)
+                # Grow to span the stacked per-site label lines beside it, so one
+                # button visibly covers the whole group of identical sites.
+                btn.setSizePolicy(
+                    QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
+                )
+                btn.setToolTip(_tooltip_html(
+                    'Build this metalloligand once with AM1-BCC; the MMET_ template '
+                    'is applied by residue name to all %d copies in the model.' % n
+                ))
+            else:
+                btn = QPushButton(
+                    'Parameterise ligand' if kind == 'free' else 'Parameterise unit'
+                )
             btn.clicked.connect(self._clicked)
             hl.addWidget(btn)
         else:
-            # Not buildable here -> no (greyed) button at all, just the reason.
-            lbl = QLabel(note)
+            # Not buildable here -> no (greyed) button at all, just the reason. Keep
+            # the visible text terse -- an unsupported metal shows just "No bundled
+            # parameters" -- with the full explanation on hover, so the row stays
+            # compact.
+            short = 'No bundled parameters' if descriptor.get('unsupported') else note
+            lbl = QLabel(short)
             lbl.setStyleSheet('color: #b0b0b0; font-style: italic;')
+            lbl.setToolTip(_tooltip_html(note))
             hl.addWidget(lbl)
         hl.addStretch()
         self.setLayout(hl)
 
+    @staticmethod
+    def _add_done_label(layout):
+        lbl = QLabel('✓ parameterised')
+        lbl.setStyleSheet('color: #4caf50; font-style: italic;')
+        layout.addWidget(lbl)
+
+    def mark_parameterised(self):
+        '''Flip this action to a green tick IN PLACE after a successful build, so the
+        just-built unit STAYS listed (the user asked that nothing be removed on
+        build) rather than the panel refreshing and reshuffling. A cluster sets
+        _on_parameterised to put a tick next to EVERY member line (delegated here);
+        a single unit flips its own button to one tick. Idempotent + best-effort.'''
+        if self._on_parameterised is not None:
+            self._on_parameterised()
+            return
+        lay = self.layout()
+        if lay is None:
+            return
+        while lay.count():
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._add_done_label(lay)
+        lay.addStretch()
+
     def _clicked(self, *_):
         if self._dialog is not None:
-            self._dialog.parameterise_unit(self._descriptor)
+            self._dialog.parameterise_unit(self._descriptor, row=self)
 
 
 class NewSectionPanel(CollapsibleArea):
@@ -914,8 +984,24 @@ class NewSectionDialog(UI_Panel_Base):
         # candidate sources. The expensive per-candidate FMCS is deferred to
         # _process_next so rows appear progressively rather than all at once.
         self._pending = self._detect()
-        self._size_scroll(len(self._pending) + 1)
-        self._process_next(self._build_gen)
+        self._size_scroll(self._pending_line_count())
+        # Defer the row build to the event loop: each row's per-candidate FMCS / CCD
+        # lookups are the slow, variable part of a scan, and building them off the
+        # loop (rather than synchronously here, under the scan's wait cursor) keeps
+        # ChimeraX responsive while the list streams in. _process_next self-schedules
+        # the remaining rows the same way.
+        gen = self._build_gen
+        QTimer.singleShot(0, lambda: self._process_next(gen))
+
+    def _pending_line_count(self):
+        '''Number of display LINES the pending entries will occupy, plus the Scan
+        row. A metal_cluster spans one line per member site (they stack beside one
+        shared button); every other entry is a single line. Used to size the scroll
+        box for the true row count, not the entry count.'''
+        n = 1  # the persistent Scan button row
+        for e in self._pending:
+            n += len(e[1]) if e[0] == 'metal_cluster' else 1
+        return n
 
     @staticmethod
     def _model_has_hydrogens(model):
@@ -926,21 +1012,21 @@ class NewSectionDialog(UI_Panel_Base):
         return bool((model.atoms.element_numbers == 1).any())
 
     def _add_scan_row(self):
-        '''The persistent "Scan for unparameterized residues" button at grid row 0.
-        Clicking it adds hydrogens (matching needs them) then repopulates; it stays
-        put so a re-click simply rescans. Appended to self.rows so the detected rows
+        '''The persistent "Search for components" button at grid row 0. Clicking it
+        adds hydrogens if needed (matching needs them) then repopulates; it stays put
+        so a re-click simply re-searches. Appended to self.rows so the detected rows
         beneath it start on the next grid line (len(self.rows)).'''
         btn = QPushButton(
-            'Scan for unparameterized residues  [adds hydrogens + builds metal/covalent sites]'
+            'Search for components  [may add hydrogens]'
         )
         btn.setStyleSheet('QPushButton { font-weight: bold; padding: 4px 10px; }')
         btn.setToolTip(
             _tooltip_html(
                 'Add hydrogens if needed (ISOLDE needs a fully protonated model, and '
-                'template matching counts hydrogens), automatically parameterise the '
-                'buildable metal sites and covalent units (AM1-BCC), then list the '
-                'residues that still have no matching MD template. Safe to click '
-                'again to rescan.'
+                'template matching counts hydrogens), then list the residues and '
+                'sites that have no matching MD template. Each buildable metal site / '
+                'covalent unit / ligand gets its own "Parameterise" button -- nothing '
+                'is built or removed automatically. Safe to click again to rescan.'
             )
         )
         btn.clicked.connect(lambda *_: self._scan())
@@ -948,10 +1034,19 @@ class NewSectionDialog(UI_Panel_Base):
         self.rows.append(btn)
 
     def _scan(self):
-        '''Scan-button action: add hydrogens (ISOLDE's addh convention), then
-        repopulate. Runs only on the user's explicit click -- the "[will add
-        hydrogens]" label flags that side effect -- and is safe to repeat. Always
-        refreshes at the end so the Scan button (and any results) are redrawn.'''
+        '''Scan-button action, STAGED across event-loop turns so ChimeraX stays
+        responsive between the heavy steps instead of freezing for their combined
+        time. Runs only on the user's explicit click and is safe to repeat.
+
+        (1) Add hydrogens (ISOLDE's addh convention -- the model must be fully
+        protonated, and template matching counts H). Then, deferred so the window
+        repaints the added H (and drops the wait cursor) first, (2) detect + list
+        via _scan_detect. Only the two monolithic, model-/OpenMM-touching calls
+        (addh, and the core template match inside _detect) briefly block -- they run
+        on the main thread and can't be backgrounded safely (ISOLDE atoms are not
+        stable across a background read); the row listing itself, including the slow
+        per-candidate FMCS / CCD lookups, then streams in with the event loop LIVE
+        (see _refresh -> _process_next).'''
         m = self.isolde.selected_model
         if m is not None and not m.deleted:
             try:
@@ -971,91 +1066,43 @@ class NewSectionDialog(UI_Panel_Base):
                         e.__class__.__name__, e
                     )
                 )
-            # Auto-run the metal/covalent unit builds that simply clear residues, so
-            # the user need not click each "Parameterise unit". Best-effort: any
-            # failure is logged and leaves that unit in the list. Guarded so a bug
-            # here can't block the scan/refresh below.
-            try:
-                self._auto_parameterise_units()
-            except Exception as e:
-                self.session.logger.warning(
-                    'New section: auto-parameterisation step failed ({}: {})'.format(
-                        e.__class__.__name__, e
-                    )
-                )
+        # Yield to the event loop before the template-match pass so the click returns
+        # and the UI repaints, rather than fusing add-H and matching into one freeze.
+        QTimer.singleShot(0, self._scan_detect)
+
+    def _scan_detect(self):
+        '''Second scan stage (deferred from _scan): run detection + (re)populate.
+        The wait cursor covers only the brief, monolithic template match in _detect;
+        the row build is then handed to the event loop by _refresh.'''
+        if self._deleted:
+            return
         with busy_cursor(self.session, 'Scanning for unparameterized residues...'):
             self._refresh()
 
     @staticmethod
     def _residue_set_key(residues):
         '''Order-independent identity for a unit -- the set of its residues' (chain,
-        number, insertion code). Stable across the repeated re-detections in the Scan
-        loop, so it can dedupe a metal site and mark one as already-attempted.'''
+        number, insertion code). Used to dedupe a metal site against the copies
+        already listed as offenders (see _detect / _detect_parameterised_metal_sites).'''
         return frozenset((r.chain_id, r.number, r.insertion_code) for r in residues)
 
-    def _auto_parameterise_units(self):
-        '''Automatically run the metal-site and covalent-unit builds that simply
-        clear their residues from the list -- the "just works, no decision" step the
-        user would otherwise trigger by hand -- so Scan resolves them in one go.
-        Free-ligand builds and template *choices* are left for the user. Only
-        buildable units are attempted (``_unit_note`` is None); an unsupported metal,
-        an unresolved site or a too-big unit is skipped and stays as an info row.
-
-        Loops detect -> build -> re-detect: a metal fan-out (one build parameterises
-        every copy of that site) then drops the siblings from the next detection
-        rather than rebuilding each, and a unit whose build raises is recorded and
-        not retried, so a persistent failure cannot spin the loop.'''
-        m = self.isolde.selected_model
-        if m is None or m.deleted:
-            return
-        attempted = set()
-        max_builds = 50  # backstop against a pathological non-converging loop
-
-        def unit_key(descriptor):
-            return self._residue_set_key(descriptor['residues'])
-
-        with busy_cursor(self.session, 'Auto-parameterising metal/covalent sites...'):
-            while not self._deleted:
-                if len(attempted) >= max_builds:
-                    self.session.logger.warning(
-                        'New section: auto-parameterisation stopped after {} builds '
-                        '(safety cap); click Scan again to continue.'.format(max_builds)
-                    )
-                    break
-                target = None
-                for entry in self._detect():
-                    if entry[0] != 'unit':
-                        continue
-                    descriptor = entry[1]
-                    if descriptor['kind'] not in ('metal', 'covalent'):
-                        continue
-                    if descriptor.get('parameterised'):
-                        continue  # already built and re-listed for reference -- skip
-                    if _unit_note(descriptor) is not None:
-                        continue  # unsupported / error / too big -> leave as info row
-                    key = unit_key(descriptor)
-                    if key in attempted:
-                        continue  # already tried and it didn't clear -- don't loop
-                    target = (descriptor, key)
-                    break
-                if target is None:
-                    break
-                descriptor, key = target
-                attempted.add(key)
-                label = self._unit_label(descriptor)
-                self.session.logger.status(
-                    'Auto-parameterising {} (AM1-BCC; may take a while)...'.format(label)
-                )
-                try:
-                    self._run_unit_pipeline(descriptor)
-                    self.session.logger.info('Parameterised {}.'.format(label))
-                except Exception as e:
-                    self.session.logger.warning(
-                        'New section: auto-parameterisation of {} failed '
-                        '({}: {})'.format(label, e.__class__.__name__, e)
-                    )
-                finally:
-                    self.session.logger.status('')
+    @staticmethod
+    def _metal_stem(descriptor):
+        '''Identity of the MMET_ template one build of this metal site would emit:
+        the sorted set of its non-standard (metalloligand) residue names. That is the
+        exact stem parameterise_metal_site keys MMET_<name> on -- which name-matches
+        (and so a SINGLE build parameterises) every copy of the metalloligand in the
+        model. Metal sites sharing a stem are therefore grouped behind one shared
+        button (see _detect / _add_unit_cluster_row). Falls back to the seed's name.'''
+        unit = descriptor.get('unit')
+        try:
+            names = sorted({r.name for r in unit.nonstandard_residues})
+            if names:
+                return tuple(names)
+        except Exception:
+            pass
+        seed = descriptor.get('seed')
+        return (seed.name,) if seed is not None else ('?',)
 
     def _process_next(self, gen):
         # Build one entry's row per event-loop turn (so each paints as it lands),
@@ -1072,6 +1119,8 @@ class NewSectionDialog(UI_Panel_Base):
             if entry[0] == 'unit':
                 descriptor = entry[1]
                 self._add_parameterise_row(i, descriptor, self._unit_label(descriptor))
+            elif entry[0] == 'metal_cluster':
+                self._add_unit_cluster_row(i, entry[1])
             else:
                 _, residue, kind, payload, descriptor = entry
                 name_cands, comp_cands = self._candidates_for(kind, payload, residue)
@@ -1094,6 +1143,13 @@ class NewSectionDialog(UI_Panel_Base):
             return
         if self._pending:
             QTimer.singleShot(0, lambda: self._process_next(gen))
+        else:
+            # Every row is built: size the scroll box to exactly its content so the
+            # list fills the space below it (no gap, no internal scrollbar). Deferred
+            # to the next event-loop turn so Qt has laid out the just-added rows first
+            # -- measuring their combined height synchronously here can under-report
+            # (e.g. a multi-line metal cluster), leaving the last rows clipped.
+            QTimer.singleShot(0, self._fit_scroll_to_content)
 
     def _compose_row(self, cell, box_row=None):
         '''Pack a row's column-0 label `cell` and its `box_row` (the cycle arrow +
@@ -1138,6 +1194,61 @@ class NewSectionDialog(UI_Panel_Base):
         line = self._compose_row(cell, prow)
         self._grid.addWidget(line, i, 0, 1, 2)
         self.rows.append(line)
+
+    def _add_unit_cluster_row(self, i, descriptors):
+        '''A group of IDENTICAL metal sites (same MMET_<ligand> stem) at grid row
+        `i`. One build of the metalloligand fans out by residue name to every copy
+        in the model (parameterise_metal_site), so the whole group shares ONE button:
+        the per-site labels are stacked one per line, and a single ParameteriseRow
+        button sits beside them SPANNING every line -- a button that genuinely takes
+        up multiple rows. One click builds them all; on success the shared button
+        flips to a green tick in place, so the sites stay listed. The whole block is a
+        single main-grid row, so it appends one entry to self.rows.
+
+        Uses an inner QGridLayout with a row-SPAN on the button rather than an
+        HBox+VBox with an Expanding policy: a grid sizes a spanning widget to the
+        combined height of the rows it covers natively, whereas addWidget-with-an-
+        alignment (or a bare Expanding policy competing with a stretch) does NOT
+        stretch it -- which is why the button previously sat at one line's height.'''
+        # _detect only clusters BUILDABLE copies (a non-buildable one is emitted as
+        # its own row so its note/✓ shows per site), so any member is a fine
+        # representative for the shared build button.
+        rep = descriptors[0]
+        n = len(descriptors)
+        block = QWidget()
+        g = QGridLayout(block)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(GAP_AFTER_NAME)
+        g.setVerticalSpacing(self._grid.verticalSpacing())
+        # Column 0: one label line per site (each keeps its own ChemSearch pencil +
+        # click-to-fly name label). Column 1: the single shared button, spanning all
+        # n rows. Column 2: a stretch spacer so labels+button stay left-hugging (the
+        # button is thus flush against the labels, not floating out to the right).
+        for row, d in enumerate(descriptors):
+            cell, _lw = self._label_cell(self._unit_label(d), d['seed'])
+            g.addWidget(cell, row, 0)
+        prow = ParameteriseRow(rep, dialog=self, cluster=descriptors)
+        g.addWidget(prow, 0, 1, n, 1)  # row 0, col 1, spanning n rows, 1 column
+        g.setColumnStretch(2, 1)
+
+        # On a successful build, replace the ONE spanning button with a ✓ next to
+        # EVERY site line -- the user asked the tick to show against all occurrences,
+        # not once for the whole group. Best-effort (the block may be gone).
+        def _mark_all_done(_g=g, _prow=prow, _n=n):
+            try:
+                _g.removeWidget(_prow)
+                _prow.setParent(None)
+                _prow.deleteLater()
+                for r in range(_n):
+                    tick = QLabel('✓ parameterised')
+                    tick.setStyleSheet('color: #4caf50; font-style: italic;')
+                    _g.addWidget(tick, r, 1)
+            except RuntimeError:
+                pass
+        prow._on_parameterised = _mark_all_done
+
+        self._grid.addWidget(block, i, 0, 1, 2)
+        self.rows.append(block)
 
     def _label_cell(self, label_text, residue, unit_residues=None):
         '''Column-0 cell for a row: a compact "edit in ChemSearch" button followed
@@ -1213,11 +1324,35 @@ class NewSectionDialog(UI_Panel_Base):
         return ' + '.join(parts) if parts else '(deleted residue)'
 
     def _size_scroll(self, n_rows):
-        # Size the scroll area to its content, up to VISIBLE_ROWS (then scroll).
-        # Fixes the default that showed only ~3 rows regardless of content.
+        '''Initial/estimated height of the scroll box for `n_rows` display lines.
+        No row cap: the panel sits at the bottom of the Validate tab (itself a
+        vertical scroll area), so it grows DOWNWARD to fit its rows into the space
+        below the collapsed panels above it, rather than being boxed into a few
+        internally-scrolling lines; the tab's own outer scroll handles any overflow.
+        _fit_scroll_to_content re-sizes to the exact content height once the rows
+        are actually built.'''
         stride = BOX_SIZE + self._grid.verticalSpacing()
-        h = max(1, min(n_rows, VISIBLE_ROWS)) * stride + 8
-        self._scroll.setFixedHeight(h)
+        self._scroll.setFixedHeight(max(1, n_rows) * stride + 8)
+
+    def _fit_scroll_to_content(self):
+        '''Set the scroll box to exactly its content's height once every row is
+        built, so the panel shows the whole list -- growing into the vertical space
+        below it -- with no leftover gap and no (redundant) inner scrollbar. Rows
+        vary in height (candidate-box rows, taller buttons, multi-line metal
+        clusters), so this trusts the laid-out content's own size hint rather than a
+        per-row estimate. Any overflow past the tab viewport is left to the tab's
+        outer scroll area. Best-effort.'''
+        if self._deleted:
+            return
+        try:
+            inner = self._scroll.widget()
+            if inner is None:
+                return
+            stride = BOX_SIZE + self._grid.verticalSpacing()
+            h = inner.sizeHint().height()
+            self._scroll.setFixedHeight(max(stride + 8, h + 6))
+        except RuntimeError:
+            pass
 
     def _clear_rows(self):
         self.remove_preview()
@@ -1663,6 +1798,15 @@ class NewSectionDialog(UI_Panel_Base):
                 pass
             residue.structure.add([s])
             self._preview_buildable[ccd_name] = True
+            # If accepting this template would RENAME the model residue (a different
+            # base component, e.g. THR -> SER -- exactly what apply_template does when
+            # the template's CCD base id differs from the residue's name), put a small
+            # sign on the model at the residue so the user sees it before committing.
+            # ccd_name is the public CCD base id (_public_ccd_id), i.e. the rename
+            # target. The sign is a label child of the preview structure, so it lives
+            # and dies with the preview.
+            if ccd_name and ccd_name != residue.name:
+                self._add_rename_sign(s, tmpl_res, ccd_name)
             return s
         except Exception as e:
             # Cache the failure so it isn't retried/re-logged on every hover, and
@@ -1675,6 +1819,29 @@ class NewSectionDialog(UI_Panel_Base):
                 )
             )
             return None
+
+    def _add_rename_sign(self, structure, residue, new_name):
+        '''Put a small "will cause rename" sign on the model at the previewed
+        residue, so the user sees up front that accepting this template changes the
+        residue type (e.g. THR -> SER). Rendered as a 3D billboard label attached to
+        `residue` (a residue of the PREVIEW `structure`), so ChimeraX keeps it a
+        child "labels" model of that structure -- it therefore appears and disappears
+        with the preview, needing no separate teardown. Best-effort: if the label
+        bundle is unavailable (e.g. no windowing system) it is simply skipped.'''
+        try:
+            from chimerax.core.objects import Objects
+            from chimerax.label.label3d import label as label3d
+            objs = Objects()
+            objs.add_atoms(residue.atoms)
+            label3d(
+                self.session, objects=objs, object_type='residues',
+                text='will cause rename → {}'.format(new_name),
+                color=(255, 190, 60, 255),      # warning amber
+                bg_color=(30, 30, 30, 200),     # dark plate for legibility
+                height=0.6, offset=(0, 1.6, 0.5), on_top=True,
+            )
+        except Exception:
+            pass
 
     # --- commit (rebuild to template) ------------------------------------
     def apply_template(self, residue, template_name):
@@ -1720,15 +1887,20 @@ class NewSectionDialog(UI_Panel_Base):
                 )
             )
 
-    def parameterise_unit(self, descriptor):
+    def parameterise_unit(self, descriptor, row=None):
         '''Build a fresh MD template for a whole unit via the existing pipeline
-        (covalent unit / metal site / free ligand), then refresh. This runs ONLY
-        on the user's explicit button click -- the simulation build never
-        parameterises on its own. AM1-BCC is synchronous and can take from seconds
-        to minutes, so a busy cursor + status line flag the wait. On success the
-        pipeline sets isolde_template_name / loads a USER_ template, so the
-        residues drop out of the next detection and the next sim start matches
-        them automatically.'''
+        (covalent unit / metal site / free ligand). Runs ONLY on the user's explicit
+        button click -- the simulation build never parameterises on its own. AM1-BCC
+        is synchronous and can take from seconds to minutes, so a busy cursor +
+        status line flag the wait.
+
+        On success the pipeline sets isolde_template_name / loads a USER_/MMET_
+        template (so the next sim start matches these residues automatically), and
+        -- rather than refreshing the panel, which would drop the just-built unit --
+        the acted-on `row`'s button is flipped to a green tick IN PLACE: the unit
+        STAYS listed (the user asked that nothing be removed on build). For a metal
+        cluster the one build fans out to every copy, and the single shared `row`
+        covers them all. On failure the button is left in place to retry.'''
         seed = descriptor['seed']
         if seed is None or seed.deleted:
             return
@@ -1737,8 +1909,10 @@ class NewSectionDialog(UI_Panel_Base):
             'Parameterising {} (running AM1-BCC; this may take a while)...'.format(label)
         )
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        ok = False
         try:
             self._run_unit_pipeline(descriptor)
+            ok = True
         except Exception as e:
             self.session.logger.warning(
                 'New section: parameterisation of {} failed ({}: {})'.format(
@@ -1748,14 +1922,16 @@ class NewSectionDialog(UI_Panel_Base):
         finally:
             QApplication.restoreOverrideCursor()
             self.session.logger.status('')
-        self._refresh()
+        if ok and row is not None:
+            try:
+                row.mark_parameterised()
+            except RuntimeError:
+                pass  # row destroyed under us (panel torn down / rescanned)
 
     def _run_unit_pipeline(self, descriptor):
         '''Dispatch a unit descriptor to the matching AM1-BCC pipeline (metal site /
-        covalent unit / free ligand). No cursor, status or refresh of its own -- the
-        caller owns those -- so it can be driven both by the manual button
-        (parameterise_unit) and by the automatic Scan loop
-        (_auto_parameterise_units).'''
+        covalent unit / free ligand). No cursor, status or in-place UI update of its
+        own -- the caller (parameterise_unit) owns those.'''
         from chimerax.isolde.openmm.amberff.covalent import (
             parameterise_metal_site,
             parameterise_covalent_unit,
@@ -2249,7 +2425,42 @@ class NewSectionDialog(UI_Panel_Base):
         non_metal = [
             e for e in entries if not (e[0] == 'unit' and e[1].get('kind') == 'metal')
         ]
-        return non_metal + metal
+        return non_metal + self._cluster_metal_entries(metal)
+
+    @staticmethod
+    def _cluster_metal_entries(metal):
+        '''Group metal-site entries for display. One build of a metalloligand fans
+        out by residue name to EVERY copy in the model (parameterise_metal_site emits
+        a name-matched MMET_<name>), so the BUILDABLE copies of a stem share ONE
+        spanning button -- emitted as a single ('metal_cluster', [descriptors])
+        entry. Only a shared *action* spans: a non-buildable copy (an unsupported
+        metal, too big, donor-failed, or already built) has no shared action, so it
+        stays a plain ('unit', descriptor) on its OWN line -- so its reason ("No
+        bundled parameters") or ✓ shows per site, not once for the whole group.
+        Order is preserved by first appearance. `metal` is the list of
+        ('unit', descriptor) metal entries.'''
+        clusters, order = {}, []
+        for e in metal:
+            stem = NewSectionDialog._metal_stem(e[1])
+            if stem not in clusters:
+                clusters[stem] = []
+                order.append(stem)
+            clusters[stem].append(e[1])
+        out = []
+        for stem in order:
+            buildable, others = [], []
+            for d in clusters[stem]:
+                if _unit_note(d) is None and not d.get('parameterised'):
+                    buildable.append(d)
+                else:
+                    others.append(d)
+            if len(buildable) > 1:
+                out.append(('metal_cluster', buildable))
+            elif buildable:
+                out.append(('unit', buildable[0]))
+            # Each non-buildable copy on its own line (its own note / ✓).
+            out.extend(('unit', d) for d in others)
+        return out
 
     def _detect_parameterised_metal_sites(self, model, ff, exclude_keys):
         '''Non-standard metal sites this panel has already parameterised: a metal-
